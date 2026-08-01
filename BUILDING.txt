@@ -4,7 +4,7 @@ Build instructions for Hadoop
 Requirements:
 
 * Unix System
-* JDK 17
+* JDK 17 or JDK 25
 * Maven 3.3 or later
 * Boost 1.86.0 (if compiling native code)
 * Protocol Buffers 3.25.5 (if compiling native code)
@@ -59,9 +59,10 @@ Installing required packages for clean install of Ubuntu 18.04 LTS Desktop.
 (For Ubuntu 20.04, gcc/g++ and cmake bundled with Ubuntu can be used.
 Refer to  dev-support/docker/Dockerfile):
 
-* Open JDK 17
+* Open JDK 17 or Open JDK 25 (install either one)
   $ sudo apt-get update
   $ sudo apt-get -y install openjdk-17-jdk
+  $ sudo apt-get -y install openjdk-25-jdk
 * Maven
   $ sudo apt-get -y install maven
 * Native libraries
@@ -137,6 +138,24 @@ Where to run Maven from?
   It can be run from any module. The only catch is that if not run from trunk
   all modules that are not part of the build run must be installed in the local
   Maven cache or available in a Maven repository.
+
+  Naming an aggregator module with -pl does not build that aggregator's children:
+  'mvn -pl hadoop-common-project -am clean install -DskipTests' selects only four
+  modules, because -am adds the upstream dependencies of the selected module and not
+  its child modules. The hadoop-common-project POM has no sources of its own, and none
+  of hadoop-auth, hadoop-common, hadoop-nfs, hadoop-kms, hadoop-registry,
+  hadoop-minikdc or hadoop-annotations is among the four, so the command reports
+  success without building any of them. Name the leaf modules instead to build the
+  full thirteen-module reactor:
+
+  $ mvn -pl "hadoop-common-project/hadoop-common,hadoop-common-project/hadoop-nfs,\
+    hadoop-common-project/hadoop-kms,hadoop-common-project/hadoop-registry,\
+    hadoop-common-project/hadoop-auth-examples" -am clean install -DskipTests
+
+  The same -pl list applies to the test invocation. Running this sequence once with
+  JAVA_HOME set to a JDK 17 installation and once with JAVA_HOME set to a JDK 25
+  installation exercises both of the JDKs the build supports; the build targets Java
+  17 class files in either case.
 
 ----------------------------------------------------------------------------------
 Maven build goals:
@@ -478,8 +497,9 @@ Installing required dependencies for clean install of macOS 10.14:
   $ xcode-select --install
 * Install Homebrew
   $ /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-* Install OpenJDK 17
+* Install OpenJDK 17 or OpenJDK 25 (install either one)
   $ brew install openjdk@17
+  $ brew install openjdk@25
 * Install maven and tools
   $ brew install maven autoconf automake cmake wget
 * Install native libraries, only openssl is required to compile native code,
@@ -521,6 +541,8 @@ Building on Rocky Linux 8
 * Install development tools such as GCC, autotools, OpenJDK and Maven.
   $ sudo dnf group install --with-optional 'Development Tools'
   $ sudo dnf install java-17-openjdk-devel maven
+  Rocky Linux 8 packages OpenJDK 17 but not OpenJDK 25; to build with JDK 25,
+  install a JDK 25 build separately and set JAVA_HOME to it.
 
 * Install python2 for building documentation.
   $ sudo dnf install python2
@@ -582,7 +604,7 @@ Building on Windows 10
 Requirements:
 
 * Windows 10
-* JDK 17
+* JDK 17 or JDK 25
 * Maven 3.3 or later (maven.apache.org)
 * Boost 1.86.0 (boost.org)
 * Protocol Buffers 3.25.5 (https://github.com/protocolbuffers/protobuf/tags)

@@ -22,7 +22,6 @@ import static org.apache.hadoop.metrics2.lib.Interns.info;
 
 import java.text.DecimalFormat;
 import java.util.Map;
-import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
@@ -35,6 +34,7 @@ import org.apache.hadoop.metrics2.MetricsRecordBuilder;
 import org.apache.hadoop.metrics2.util.Quantile;
 import org.apache.hadoop.metrics2.util.QuantileEstimator;
 import org.apache.hadoop.metrics2.util.SampleQuantiles;
+import org.apache.hadoop.util.concurrent.HadoopExecutors;
 
 import org.apache.hadoop.classification.VisibleForTesting;
 import org.apache.hadoop.thirdparty.com.google.common.util.concurrent.ThreadFactoryBuilder;
@@ -65,7 +65,7 @@ public class MutableQuantiles extends MutableMetric {
   @VisibleForTesting
   protected Map<Quantile, Long> previousSnapshot = null;
 
-  private static final ScheduledExecutorService scheduler = Executors
+  private static final ScheduledExecutorService scheduler = HadoopExecutors
       .newScheduledThreadPool(1, new ThreadFactoryBuilder().setDaemon(true)
           .setNameFormat("MutableQuantiles-%d").build());
 

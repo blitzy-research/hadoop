@@ -24,7 +24,6 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingDeque;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
@@ -41,6 +40,7 @@ import org.apache.hadoop.metrics2.impl.MetricsCollectorImpl;
 import org.apache.hadoop.util.Preconditions;
 import org.apache.hadoop.thirdparty.com.google.common.util.concurrent.ThreadFactoryBuilder;
 import org.apache.hadoop.util.Time;
+import org.apache.hadoop.util.concurrent.HadoopExecutors;
 
 import javax.annotation.Nullable;
 
@@ -64,7 +64,7 @@ public class MutableRollingAverages extends MutableMetric implements Closeable {
       new MutableRatesWithAggregation();
 
   @VisibleForTesting
-  static final ScheduledExecutorService SCHEDULER = Executors
+  static final ScheduledExecutorService SCHEDULER = HadoopExecutors
       .newScheduledThreadPool(1, new ThreadFactoryBuilder().setDaemon(true)
           .setNameFormat("MutableRollingAverages-%d").build());
 

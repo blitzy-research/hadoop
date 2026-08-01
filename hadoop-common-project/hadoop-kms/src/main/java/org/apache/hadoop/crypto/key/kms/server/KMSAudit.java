@@ -28,6 +28,7 @@ import org.apache.hadoop.crypto.key.kms.server.KeyAuthorizationKeyProvider.KeyOp
 import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.hadoop.util.ReflectionUtils;
 import org.apache.hadoop.util.Time;
+import org.apache.hadoop.util.concurrent.HadoopExecutors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -42,7 +43,6 @@ import java.util.Arrays;
 import java.util.HashSet;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.Collection;
@@ -97,7 +97,7 @@ public class KMSAudit {
                 }
               }
             }).build();
-    executor = Executors.newScheduledThreadPool(1, new ThreadFactoryBuilder()
+    executor = HadoopExecutors.newScheduledThreadPool(1, new ThreadFactoryBuilder()
         .setDaemon(true).setNameFormat(KMS_LOGGER_NAME + "_thread").build());
     executor.scheduleAtFixedRate(new Runnable() {
       @Override

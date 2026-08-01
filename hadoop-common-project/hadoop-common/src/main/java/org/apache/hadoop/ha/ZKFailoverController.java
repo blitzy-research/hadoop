@@ -23,7 +23,6 @@ import java.security.PrivilegedAction;
 import java.security.PrivilegedExceptionAction;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
@@ -54,6 +53,7 @@ import org.apache.hadoop.util.ToolRunner;
 import org.apache.zookeeper.data.ACL;
 import org.apache.hadoop.classification.VisibleForTesting;
 import org.apache.hadoop.util.Preconditions;
+import org.apache.hadoop.util.concurrent.HadoopExecutors;
 
 import org.apache.hadoop.thirdparty.com.google.common.util.concurrent.ThreadFactoryBuilder;
 import org.slf4j.Logger;
@@ -127,7 +127,7 @@ public abstract class ZKFailoverController {
 
   /** Executor on which {@link #scheduleRecheck(long)} schedules events */
   private ScheduledExecutorService delayExecutor =
-    Executors.newScheduledThreadPool(1,
+    HadoopExecutors.newScheduledThreadPool(1,
         new ThreadFactoryBuilder().setDaemon(true)
             .setNameFormat("ZKFC Delay timer #%d")
             .build());
