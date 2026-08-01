@@ -58,6 +58,7 @@ import org.apache.hadoop.fs.CommonConfigurationKeys;
 import org.apache.hadoop.util.ReflectionUtils;
 import org.apache.hadoop.util.StringUtils;
 import org.apache.hadoop.util.Timer;
+import org.apache.hadoop.util.concurrent.HadoopThreadPoolExecutor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -312,7 +313,7 @@ public class Groups {
         // With coreThreadCount == maxThreadCount we effectively
         // create a fixed size thread pool. As allowCoreThreadTimeOut
         // has been set, all threads will die after 60 seconds of non use
-        ThreadPoolExecutor parentExecutor =  new ThreadPoolExecutor(
+        ThreadPoolExecutor parentExecutor =  new HadoopThreadPoolExecutor(
             reloadGroupsThreadCount,
             reloadGroupsThreadCount,
             60,

@@ -35,6 +35,7 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 import org.apache.hadoop.classification.VisibleForTesting;
 import org.apache.hadoop.util.Preconditions;
+import org.apache.hadoop.util.concurrent.HadoopThreadPoolExecutor;
 import org.apache.hadoop.thirdparty.com.google.common.cache.CacheBuilder;
 import org.apache.hadoop.thirdparty.com.google.common.cache.CacheLoader;
 import org.apache.hadoop.thirdparty.com.google.common.cache.LoadingCache;
@@ -253,7 +254,7 @@ public class ValueQueue <E> {
                 });
 
     executor =
-        new ThreadPoolExecutor(numFillerThreads, numFillerThreads, 0L,
+        new HadoopThreadPoolExecutor(numFillerThreads, numFillerThreads, 0L,
             TimeUnit.MILLISECONDS, queue, new ThreadFactoryBuilder()
                 .setDaemon(true)
                 .setNameFormat(REFILL_THREAD).build());

@@ -58,14 +58,15 @@ public final class HadoopExecutors {
   //Executors.newSingleThreadExecutor has special semantics - for the
   // moment we'll delegate to it rather than implement the semantics here.
   public static ExecutorService newSingleThreadExecutor() {
-    return Executors.newSingleThreadExecutor();
+    return new SubjectPreservingExecutorService(Executors.newSingleThreadExecutor());
   }
 
   //Executors.newSingleThreadExecutor has special semantics - for the
   // moment we'll delegate to it rather than implement the semantics here.
   public static ExecutorService newSingleThreadExecutor(ThreadFactory
       threadFactory) {
-    return Executors.newSingleThreadExecutor(threadFactory);
+    return new SubjectPreservingExecutorService(
+        Executors.newSingleThreadExecutor(threadFactory));
   }
 
   public static ScheduledExecutorService newScheduledThreadPool(
@@ -81,14 +82,16 @@ public final class HadoopExecutors {
   //Executors.newSingleThreadScheduledExecutor has special semantics - for the
   // moment we'll delegate to it rather than implement the semantics here
   public static ScheduledExecutorService newSingleThreadScheduledExecutor() {
-    return Executors.newSingleThreadScheduledExecutor();
+    return new SubjectPreservingScheduledExecutorService(
+        Executors.newSingleThreadScheduledExecutor());
   }
 
   //Executors.newSingleThreadScheduledExecutor has special semantics - for the
   // moment we'll delegate to it rather than implement the semantics here
   public static ScheduledExecutorService newSingleThreadScheduledExecutor(
       ThreadFactory threadFactory) {
-    return Executors.newSingleThreadScheduledExecutor(threadFactory);
+    return new SubjectPreservingScheduledExecutorService(
+        Executors.newSingleThreadScheduledExecutor(threadFactory));
   }
 
   /**
