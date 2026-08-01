@@ -22,10 +22,8 @@ import java.io.ByteArrayOutputStream;
 import java.io.PrintWriter;
 import java.net.URL;
 import java.net.URLClassLoader;
-import static java.security.AccessController.*;
 
 import java.nio.charset.StandardCharsets;
-import java.security.PrivilegedAction;
 import java.util.Arrays;
 import java.util.Iterator;
 import java.util.Map;
@@ -246,11 +244,7 @@ class MetricsConfig extends SubsetConfiguration {
       if (LOG.isDebugEnabled()) {
         LOG.debug("Using plugin jars: {}", Iterables.toString(jars));
       }
-      pluginLoader = doPrivileged(new PrivilegedAction<ClassLoader>() {
-        @Override public ClassLoader run() {
-          return new URLClassLoader(urls, defaultLoader);
-        }
-      });
+      pluginLoader = new URLClassLoader(urls, defaultLoader);
       return pluginLoader;
     }
     if (parent instanceof MetricsConfig) {

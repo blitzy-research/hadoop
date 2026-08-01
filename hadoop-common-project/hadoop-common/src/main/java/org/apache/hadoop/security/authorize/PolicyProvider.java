@@ -17,14 +17,13 @@
  */
 package org.apache.hadoop.security.authorize;
 
-import java.security.Policy;
 
 import org.apache.hadoop.classification.InterfaceAudience;
 import org.apache.hadoop.classification.InterfaceStability;
 
 /**
- * {@link PolicyProvider} provides the {@link Service} definitions to the
- * security {@link Policy} in effect for Hadoop.
+ * {@link PolicyProvider} provides the {@link Service} definitions in effect
+ * for Hadoop's service-level authorization.
  *
  */
 @InterfaceAudience.LimitedPrivate({"HDFS", "MapReduce"})
