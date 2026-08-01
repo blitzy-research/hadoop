@@ -32,6 +32,7 @@ import static org.apache.hadoop.io.nativeio.NativeIO.POSIX.POSIX_FADV_WILLNEED;
 import org.apache.hadoop.classification.VisibleForTesting;
 import org.apache.hadoop.util.Preconditions;
 import org.apache.hadoop.util.concurrent.HadoopThreadPoolExecutor;
+import org.apache.hadoop.util.concurrent.SubjectPreservingTasks;
 import org.apache.hadoop.thirdparty.com.google.common.util.concurrent.ThreadFactoryBuilder;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -75,7 +76,7 @@ public class ReadaheadPool {
   private ReadaheadPool() {
     pool = new HadoopThreadPoolExecutor(POOL_SIZE, MAX_POOL_SIZE, 3L, TimeUnit.SECONDS,
         new ArrayBlockingQueue<Runnable>(CAPACITY));
-    pool.setRejectedExecutionHandler(new ThreadPoolExecutor.DiscardOldestPolicy());
+    pool.setRejectedExecutionHandler(new DiscardOldestRequest());
     pool.setThreadFactory(new ThreadFactoryBuilder()
       .setDaemon(true)
       .setNameFormat("Readahead Thread #%d")
@@ -254,6 +255,39 @@ public class ReadaheadPool {
     public String toString() {
       return "ReadaheadRequestImpl [identifier='" + identifier + "', fd=" + fd
           + ", off=" + off + ", len=" + len + "]";
+    }
+  }
+
+  /**
+   * Drops the oldest queued request to make room for a rejected one, exactly as
+   * {@link ThreadPoolExecutor.DiscardOldestPolicy} does, and offers the rejected
+   * request back to the pool as it was submitted.
+   * <p>
+   * The discarding and the retry are left to the policy this extends, so which
+   * request is dropped, and the fact that a request is dropped rather than
+   * retried once the pool is shut down, are unchanged.
+   * <p>
+   * What changes is the request the retry is made with. The pool prepares each
+   * task it is given so that the task runs under the subject of the thread that
+   * submitted it, and the request this handler receives has already been through
+   * that. Offering back {@link SubjectPreservingTasks#unwrap(Runnable)} of it
+   * retries with the request as it was submitted, so the pool goes on reporting
+   * the readahead request by its own type however often a request is rejected
+   * and retried. The retry runs on the thread that submitted the request, so
+   * preparing it again there carries the same subject as the first time.
+   * <p>
+   * A single preparation is guaranteed in any case, because
+   * {@link SubjectPreservingTasks#wrap(Runnable)} hands back an already prepared
+   * task unchanged. Unwrapping here makes the guarantee hold at this boundary on
+   * its own terms, without depending on what the pool does with a task it is
+   * offered twice.
+   */
+  private static final class DiscardOldestRequest
+      extends ThreadPoolExecutor.DiscardOldestPolicy {
+
+    @Override
+    public void rejectedExecution(Runnable r, ThreadPoolExecutor e) {
+      super.rejectedExecution(SubjectPreservingTasks.unwrap(r), e);
     }
   }
 }

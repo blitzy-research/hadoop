@@ -63,10 +63,10 @@ public class HadoopScheduledThreadPoolExecutor extends
    * <p>
    * The subject is read here, on the scheduling thread, rather than when a
    * worker thread is created, so the task runs as whoever scheduled it even on
-   * a pool that reuses its threads. {@link SubjectPreservingTasks} describes
-   * why the runtime no longer carries a subject across a thread boundary on
-   * its own, and hands back the task unchanged when there is no subject to
-   * carry.
+   * a pool that reuses its threads, and runs under no identity at all when
+   * whoever scheduled it had none. {@link SubjectPreservingTasks} describes why
+   * an identity has to be carried across a thread boundary this way, and why it
+   * is carried for every task rather than only for some.
    *
    * @param command the task to run
    * @param delay how long to wait before the task runs

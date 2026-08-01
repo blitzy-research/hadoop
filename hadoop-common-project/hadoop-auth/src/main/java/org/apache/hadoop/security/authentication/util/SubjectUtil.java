@@ -62,24 +62,41 @@ import org.apache.hadoop.classification.InterfaceAudience.Private;
  * exports, so looking them up needs no module-opening or module-export flag on
  * the JVM command line.
  * <p>
- * The bridge reflects over that replacement API and never over a Security
- * Manager era one: it makes new behaviour reachable from old bytecode rather
- * than keeping a legacy code path alive, so no Security Manager era code path
- * survives behind it. The names of the legacy classes survive only as the three
- * {@code loadClass} string arguments of the pre-18 fallback lookups
- * {@code lookupGetSubject()} and {@code lookupGetContext()}, at lines 236, 258
- * and 260, and in the comments that explain them; the compiler therefore
- * resolves no reference to any of those types, and those lookups are reached
- * only on a JVM that still implements them.
+ * On a release 18 or later runtime the bridge binds the handles of the
+ * replacement API and nothing else, and that covers every runtime on which the
+ * Security Manager is permanently disabled: there it neither resolves nor
+ * invokes a Security Manager era API, so no code path of that era is reached at
+ * all. Reflecting this way makes new behaviour reachable from old bytecode; it
+ * does not keep an old code path alive.
  * <p>
- * {@link #THREAD_INHERITS_SUBJECT} is the switch that keeps this migration a
- * provable no-op on JDK 17. Code that has to re-establish an identity on
+ * A JVM older than release 18 has no replacement API to bind to, so a fallback
+ * is deliberately retained for it, unchanged and predating this migration:
+ * there {@link #current()} is backed by the pre-18 lookups
+ * {@code lookupGetSubject()} and {@code lookupGetContext()}, which name the
+ * classes the replacement API supersedes as {@code loadClass} string arguments,
+ * and the {@code doAs} overloads are backed by the pre-18 {@code Subject.doAs}.
+ * Those lookups are reached only on such a JVM, and those class names appear in
+ * this file only as those string arguments and in the comments that explain
+ * them, so the compiler resolves no reference to any of them.
+ * <p>
+ * {@link #THREAD_INHERITS_SUBJECT} reports one thing only: whether the running
+ * JVM still hands the current subject to a thread it is asked to create. It
+ * says nothing about a thread that already exists, so it cannot stand in for a
+ * task reaching a worker that was created earlier, and for someone else.
+ * Code that has to re-establish an identity on
  * another thread reads the subject with {@link #current()} on the thread that
  * still carries it, then applies it on the other thread through one of the
  * {@code doAs} overloads rather than through {@code callAs}: only the
  * {@code doAs} overloads unwrap the {@link CompletionException} that the
  * replacement API is specified to throw, and re-throw the original cause, so
  * the exception a caller observes is unchanged by this migration.
+ * <p>
+ * Throughout the class an action is required and a subject is not: every
+ * overload rejects a {@code null} action, while a {@code null} subject is legal
+ * and runs the action with no subject associated with it. That is not the same
+ * as leaving the subject of an enclosing scope in place, so a caller that wants
+ * a no-op when {@link #current()} finds nothing should skip the call rather than
+ * pass the {@code null} on.
  * <p>
  * This is derived from Apache Calcite Avatica, which is derived from the Jetty
  * implementation.
@@ -105,9 +122,18 @@ public final class SubjectUtil {
    * no configuration key of its own: it is derived from the running JVM, and is
    * {@code true} for a Java specification version of 21 or lower, where a new
    * thread still inherits the subject of the thread that created it, and
-   * {@code false} from 24 onwards, where it does not. Code that only needs to
-   * carry the subject across a boundary the JVM no longer crosses for it can
-   * guard on this flag and so reduce to a provable no-op on JDK 17.
+   * {@code false} for every version above 21. From 24 onwards a new thread never
+   * inherits it. On 22 and 23 inheritance is conditional, and the flag reports
+   * {@code false} for them too, so that code guarding on it carries the subject
+   * itself instead of relying on a condition it does not test; both are
+   * end-of-life non-LTS releases, where carrying it needlessly is preferred to
+   * risking its loss. Code that only needs to carry the subject across a boundary
+   * the JVM no longer crosses for it can guard on this flag and so reduce to a
+   * provable no-op on JDK 17.
+   * Handing a task to a thread that already exists is not that boundary: no
+   * runtime gives such a task the subject of whoever submitted it, so this flag
+   * does not answer that question and code crossing that boundary has to carry
+   * the subject itself on every runtime.
    */
   public static final boolean THREAD_INHERITS_SUBJECT = checkThreadInheritsSubject();
 
@@ -314,6 +340,10 @@ public final class SubjectUtil {
    * {@code callAs}, which is what keeps exception identity intact for a task
    * whose failure is later reported by a {@code Future} or by a pool's
    * uncaught-exception handling.
+   * <p>
+   * The action is required and the subject is not. A {@code null} subject is
+   * legal and runs the action with no subject associated with it, which is not
+   * the same as leaving the subject of an enclosing scope in place.
    *
    * @param subject the subject this action runs as
    * @param action the action to run
@@ -356,6 +386,10 @@ public final class SubjectUtil {
    * supported runtime. A call site therefore moves onto this method by changing
    * the class it calls and nothing else, with no edit to its {@code throws}
    * clause or to its {@code catch} blocks.
+   * <p>
+   * As with the other overload, the action is required and the subject is not: a
+   * {@code null} subject is legal and runs the action with no subject associated
+   * with it, rather than leaving the subject of an enclosing scope in place.
    *
    * @param subject the subject this action runs as
    * @param action the action to run

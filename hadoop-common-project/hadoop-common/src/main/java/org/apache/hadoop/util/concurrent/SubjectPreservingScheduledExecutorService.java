@@ -30,58 +30,42 @@ import java.util.concurrent.TimeUnit;
  * subject into every task it passes to the scheduled executor service it
  * wraps.
  * <p>
- * Scheduling a task is the one thing {@link ScheduledExecutorService} adds to
- * an ordinary executor service, and it adds it in exactly four methods. Each of
- * those four sends its task through the wrapping methods of
- * {@link SubjectPreservingTasks} on its way in. Those methods read the subject
- * of the thread that calls them, and each is called here from the thread doing
- * the scheduling, so a task runs under the identity of whoever scheduled it
- * rather than under the identity that happened to be current when a worker
- * thread was created. That distinction is what keeps the result correct for a
- * service that schedules for several callers on one reused worker.
+ * The four scheduling methods send their task through
+ * {@link SubjectPreservingTasks} on its way in, always on the thread doing the
+ * scheduling, so a task runs under the identity of whoever scheduled it rather
+ * than the identity current when a worker was created. The inherited submission
+ * methods cover every other way a task can be handed over, and because this
+ * class forwards to a separate service rather than routing back through itself,
+ * every task is wrapped exactly once whichever way it arrives.
  * <p>
- * The submission methods of {@link SubjectPreservingExecutorService} are
- * inherited exactly as they are, and they cover every other way a task can be
- * handed over. They remain correct here because this class forwards to a
- * separate service: an inherited method wraps a task once and then passes it to
- * that service, whose own routing of the task stays inside itself and never
- * comes back through the four methods below. Every task is therefore wrapped
- * once, whichever way it arrives.
+ * A repeating task re-establishes the subject of the thread that scheduled it on
+ * every one of its executions, for as long as it goes on repeating: the subject
+ * is read once, when the schedule is created, so however much later a repetition
+ * falls it runs under the identity the schedule was created under. Long-lived
+ * work whose purpose is to maintain a caller's credentials depends on that.
  * <p>
- * A repeating task re-establishes the subject of the thread that scheduled it
- * on every one of its executions, for as long as it goes on repeating. The
- * subject is read once, when the schedule is created, so the identity a
- * repetition runs under is the identity the schedule was created under, however
- * much later that repetition falls. Long-lived work whose whole purpose is to
- * maintain a caller's credentials depends on precisely that.
+ * Nothing else is altered. A delay, a period and a unit are passed on as given,
+ * so the wrapped service keeps sole charge of its timing and still refuses an
+ * argument it would have refused before, and the {@link ScheduledFuture} handed
+ * back is the one it returned rather than a stand-in, so cancelling a task,
+ * waiting on its result and reading its remaining delay all behave as they did.
  * <p>
- * Nothing else is altered. A delay, a period and a unit are passed on just as
- * they were given, so the wrapped service keeps sole charge of its timing and
- * still refuses an argument it would have refused before. The future handed
- * back is the one the wrapped service returned, not a stand-in for it, so
- * cancelling a task, waiting on its result and reading its remaining delay all
- * behave as they did.
+ * It forwards rather than extends because {@link HadoopThreadPoolExecutor} is
+ * final and the single-thread scheduled services {@link HadoopExecutors} obtains
+ * from {@link java.util.concurrent.Executors} are implementations Hadoop cannot
+ * see into, with particular semantics it has deliberately not reproduced.
  * <p>
- * It forwards rather than extends, for two reasons.
- * {@link HadoopThreadPoolExecutor} is final and so cannot be extended at all.
- * And the single-thread scheduled services {@link HadoopExecutors} obtains from
- * {@link java.util.concurrent.Executors} are implementations Hadoop cannot see
- * into, with particular semantics it has deliberately not reproduced; putting a
- * forwarding service in front of one adds the propagation while leaving those
- * semantics untouched.
- * <p>
- * Only such a service should be wrapped. A pool Hadoop owns, such as
- * {@link HadoopScheduledThreadPoolExecutor}, already wraps the tasks handed to
- * it, so placing this in front of one would wrap them a second time. Because
- * {@link SubjectPreservingTasks#unwrap(Runnable)} removes a single layer by
- * design, code that reports on a task instead of running it would then be left
- * looking at a wrapper rather than at the task submitted.
+ * Only such a service needs to be wrapped. A pool Hadoop owns, such as
+ * {@link HadoopScheduledThreadPoolExecutor}, already carries the identity into
+ * the tasks handed to it, so placing this in front of one would ask for the
+ * same thing twice: {@link SubjectPreservingTasks#wrap(Runnable)} hands back a task it
+ * has already prepared, so nothing is layered twice and nothing that reports on
+ * a task is misled, but the second request buys nothing either.
  */
 @InterfaceAudience.Private
 public class SubjectPreservingScheduledExecutorService
     extends SubjectPreservingExecutorService implements ScheduledExecutorService {
 
-  /** The scheduled executor service every scheduling call is forwarded to. */
   private final ScheduledExecutorService scheduledDelegate;
 
   /**

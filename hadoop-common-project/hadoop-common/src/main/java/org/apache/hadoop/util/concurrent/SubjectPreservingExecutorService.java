@@ -39,37 +39,38 @@ import static java.util.Objects.requireNonNull;
  * every task it passes to the executor service it wraps.
  * <p>
  * Each task goes through {@link SubjectPreservingTasks#wrap(Runnable)} or
- * {@link SubjectPreservingTasks#wrap(Callable)} on its way in. Those methods
- * read the subject on the thread that calls them, and every one of them is
- * called here from the thread that is submitting the task. The identity a task
- * runs under is therefore the identity of its own submitter, and not the
- * identity that happened to be current when a worker thread was created. That
- * distinction is what keeps the result correct for a pool that serves several
- * submitters from one reused worker.
+ * {@link SubjectPreservingTasks#wrap(Callable)} on its way in, and always on
+ * the submitting thread, so a task runs under the identity of its own submitter
+ * rather than the identity current when a worker was created. That is what
+ * keeps a pool correct when one reused worker serves several submitters.
  * <p>
- * Nothing else is altered. Every other call, the whole of the shutdown
- * lifecycle included, goes straight to the wrapped service, which keeps its own
- * behaviour in full. This class adds the propagation of an identity and changes
- * nothing besides.
+ * Nothing else is altered. Every other call goes straight to the wrapped
+ * service, which keeps its own behaviour in full. The one place where
+ * forwarding alone would not be faithful is
+ * {@link #shutdownNow()}: the wrapped service holds the tasks this class
+ * prepared for it and hands those back, so they are returned in the form they
+ * were submitted in, which is what a caller asking for its unstarted work is
+ * owed. This class adds the propagation of an identity and changes nothing
+ * besides.
+ * The bulk methods copy the tasks into a new list in iteration order, so the
+ * collection passed in is left as it was and the futures returned line up with
+ * it one for one.
  * <p>
- * It forwards rather than extends, for two reasons.
- * {@link HadoopThreadPoolExecutor} is final and so cannot be extended at all.
- * And the single-thread services {@link HadoopExecutors} obtains from
- * {@link java.util.concurrent.Executors} are implementations Hadoop cannot see
- * into, with particular semantics it has deliberately not reproduced; putting a
- * forwarding service in front of one adds the propagation while leaving those
- * semantics untouched.
+ * It forwards rather than extends because {@link HadoopThreadPoolExecutor} is
+ * final, and because the single-thread services {@link HadoopExecutors} obtains
+ * from {@link java.util.concurrent.Executors} are implementations Hadoop cannot
+ * see into, with particular semantics it has deliberately not reproduced;
+ * forwarding adds the propagation and leaves those semantics untouched.
  * <p>
- * Only such a service should be wrapped. A pool Hadoop owns already wraps the
- * tasks handed to it, so placing this in front of one would wrap them a second
- * time. Because {@link SubjectPreservingTasks#unwrap(Runnable)} removes a
- * single layer by design, code that reports on a task instead of running it
- * would then be left looking at a wrapper rather than at the task submitted.
+ * Such a service is what this is for. A pool Hadoop owns already prepares the
+ * tasks handed to it, so placing this in front of one adds a step that pool
+ * does not need; it is harmless, because
+ * {@link SubjectPreservingTasks#wrap(Runnable)} hands back a task that is
+ * already prepared, but there is nothing to gain from it.
  */
 @InterfaceAudience.Private
 public class SubjectPreservingExecutorService extends ForwardingExecutorService {
 
-  /** The executor service every call is forwarded to. */
   private final ExecutorService delegate;
 
   /**
@@ -83,14 +84,24 @@ public class SubjectPreservingExecutorService extends ForwardingExecutorService 
     this.delegate = requireNonNull(delegate);
   }
 
-  /**
-   * Returns the executor service every call is forwarded to.
-   *
-   * @return the wrapped executor service, never {@code null}
-   */
   @Override
   protected ExecutorService delegate() {
     return delegate;
+  }
+
+  /**
+   * Stops the wrapped service at once and returns the tasks that had not
+   * started, as they were submitted.
+   * <p>
+   * The wrapped service queued the tasks this class prepared for it, and hands
+   * those back. A caller is owed what it submitted, so each one is returned in
+   * that form; the wrapped service's own shutdown behaviour is untouched.
+   *
+   * @return the tasks that never started, each as it was submitted
+   */
+  @Override
+  public List<Runnable> shutdownNow() {
+    return SubjectPreservingTasks.unwrapAll(super.shutdownNow());
   }
 
   /**
@@ -142,10 +153,6 @@ public class SubjectPreservingExecutorService extends ForwardingExecutorService 
   /**
    * Runs every one of the given tasks under the subject current on this
    * thread, and returns once all of them have finished.
-   * <p>
-   * The tasks are copied into a new list in the order the given collection
-   * iterates, so the collection passed in is left as it was and the futures
-   * returned line up with it one for one.
    *
    * @param <T> the result type of the tasks
    * @param tasks the tasks to run
@@ -168,10 +175,6 @@ public class SubjectPreservingExecutorService extends ForwardingExecutorService 
    * Runs every one of the given tasks under the subject current on this
    * thread, and returns once all of them have finished or the wait has run
    * out.
-   * <p>
-   * The tasks are copied into a new list in the order the given collection
-   * iterates, so the collection passed in is left as it was and the futures
-   * returned line up with it one for one.
    *
    * @param <T> the result type of the tasks
    * @param tasks the tasks to run
@@ -195,9 +198,6 @@ public class SubjectPreservingExecutorService extends ForwardingExecutorService 
   /**
    * Runs the given tasks under the subject current on this thread and returns
    * the result of one that finished without failing.
-   * <p>
-   * The tasks are copied into a new list in the order the given collection
-   * iterates, so the collection passed in is left as it was.
    *
    * @param <T> the result type of the tasks
    * @param tasks the tasks to run
@@ -218,9 +218,6 @@ public class SubjectPreservingExecutorService extends ForwardingExecutorService 
   /**
    * Runs the given tasks under the subject current on this thread and returns
    * the result of one that finished without failing before the wait ran out.
-   * <p>
-   * The tasks are copied into a new list in the order the given collection
-   * iterates, so the collection passed in is left as it was.
    *
    * @param <T> the result type of the tasks
    * @param tasks the tasks to run

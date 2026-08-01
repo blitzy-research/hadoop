@@ -58,7 +58,7 @@ import org.apache.hadoop.fs.CommonConfigurationKeys;
 import org.apache.hadoop.util.ReflectionUtils;
 import org.apache.hadoop.util.StringUtils;
 import org.apache.hadoop.util.Timer;
-import org.apache.hadoop.util.concurrent.HadoopThreadPoolExecutor;
+import org.apache.hadoop.util.concurrent.SubjectPreservingExecutorService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -313,7 +313,7 @@ public class Groups {
         // With coreThreadCount == maxThreadCount we effectively
         // create a fixed size thread pool. As allowCoreThreadTimeOut
         // has been set, all threads will die after 60 seconds of non use
-        ThreadPoolExecutor parentExecutor =  new HadoopThreadPoolExecutor(
+        ThreadPoolExecutor parentExecutor =  new ThreadPoolExecutor(
             reloadGroupsThreadCount,
             reloadGroupsThreadCount,
             60,
@@ -321,7 +321,15 @@ public class Groups {
             new LinkedBlockingQueue<>(),
             threadFactory);
         parentExecutor.allowCoreThreadTimeOut(true);
-        executorService = MoreExecutors.listeningDecorator(parentExecutor);
+        // A reload runs on one of these threads on behalf of whoever the cache
+        // was asked on behalf of, so the reload is given that caller's JAAS
+        // subject. Only the handing over of the reload is decorated: a reload
+        // that fails is reported by the callback below, which counts it, and a
+        // failure to find a user's groups is an ordinary outcome of a reload
+        // rather than something to name in the log, so the pool itself is left
+        // as one that keeps a failure inside the future it belongs to.
+        executorService = MoreExecutors.listeningDecorator(
+            new SubjectPreservingExecutorService(parentExecutor));
       }
     }
 
