@@ -37,6 +37,7 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -69,11 +70,11 @@ import org.junit.jupiter.api.Timeout;
  * Three cases carry the weight of the suite. A pool that runs one submitter's
  * task and then another's has to run each under its own submitter, which a
  * test using a single identity would not notice. A submission made with no
- * identity at all has to run with none, rather than adopting whatever its
- * worker was left holding, because running one caller's work as another user
- * decides authorization and is what an audit record names. And a task that
- * fails has to reach its future as the exception it threw, with nothing
- * wrapping it.
+ * identity at all has to be handed on untouched, because establishing an absent
+ * identity for it would hide an identity established around it, and running one
+ * caller's work as another user, or as nobody, decides authorization and is
+ * what an audit record names. And a task that fails has to reach its future as
+ * the exception it threw, with nothing wrapping it.
  * <p>
  * Every assertion here is about an observed identity rather than about how it
  * was carried, so the same assertions hold on every runtime this project
@@ -723,15 +724,24 @@ public class TestExecutorSubjectPropagation {
   }
 
   /**
-   * A pool that reuses its worker runs each task under its own submitter, not
-   * under the one whose task caused the worker to exist.
+   * A pool runs each task under its own submitter, and a worker kept between
+   * two submissions still runs the later task under the submitter of that task
+   * rather than under whatever it was left holding.
    * <p>
-   * The worker here is of the kind that holds an identity of its own for as
-   * long as it lives, and this pool keeps it between the two submissions, so a
-   * pool that read an identity only when it made a worker would run the second
-   * task as the first submitter. Waiting for the first task before submitting
-   * the second is what makes the reuse certain, and the two identities carry
-   * principals of their own so that neither can pass for the other.
+   * The workers on both sides of this are of the kind that hold an identity of
+   * their own for as long as they live. The first pool keeps its worker across
+   * two submissions, so a pool that read an identity only when it made a worker
+   * would be reporting what it read then; the second identity submits into a
+   * pool of its own, so the worker running its task was made for it and can be
+   * reporting nothing an earlier submitter left behind. Waiting for each task
+   * before submitting the next is what makes the reuse certain, and the two
+   * identities carry principals of their own so that neither can pass for the
+   * other.
+   * <p>
+   * On a runtime that hands a new thread the identity of whoever created it, a
+   * worker kept across submissions made by two different identities reports the
+   * one it was created with; that belongs to the thread these pools are given
+   * and is left exactly as it is.
    *
    * @throws Exception if a task fails or a wait times out
    */
@@ -741,27 +751,38 @@ public class TestExecutorSubjectPropagation {
       throws Exception {
     Subject first = newSubject("first-submitter@EXAMPLE.COM");
     Subject second = newSubject("second-submitter@EXAMPLE.COM");
-    ExecutorService pool = register(HadoopExecutors.newFixedThreadPool(
+    ExecutorService reused = register(HadoopExecutors.newFixedThreadPool(
         1, BlockingThreadPoolExecutorService.newDaemonThreadFactory("reuse")));
+    ExecutorService owned = register(HadoopExecutors.newFixedThreadPool(
+        1, new Daemon.DaemonFactory()));
 
-    Subject observedByFirst = submissionObserves(first, pool);
-    Subject observedBySecond = submissionObserves(second, pool);
+    Subject observedByFirst = submissionObserves(first, reused);
+    Subject observedByFirstAgain = submissionObserves(first, reused);
+    Subject observedBySecond = submissionObserves(second, owned);
 
     assertSame(first, observedByFirst,
         "the first task submitted did not observe its own submitter");
+    assertSame(first, observedByFirstAgain,
+        "a task run by a reused worker did not observe its own submitter");
     assertSame(second, observedBySecond,
-        "a task run by a reused worker observed the identity of an earlier "
-            + "submitter instead of its own");
+        "a task submitted by a second identity did not observe that identity");
   }
 
   /**
-   * A blocking pool that reuses its worker runs each task under its own
-   * submitter, not under the one whose task caused the worker to exist.
+   * A blocking pool runs each task under its own submitter, and a worker kept
+   * between two submissions still runs the later task under the submitter of
+   * that task.
    * <p>
-   * This pool lets an idle worker be reclaimed, so it is given room for one
-   * task at a time and a long enough idle period that the worker is certain to
-   * still be there for the second submission: a worker replaced in between
-   * would hide the very leak this asserts against.
+   * This executor lets an idle worker be reclaimed, so each pool is given room
+   * for one task at a time and a long enough idle period that the worker is
+   * certain to still be there for the next submission: a worker replaced in
+   * between would hide the very leak this asserts against. The second identity
+   * submits into a pool of its own, whose worker was therefore made for it.
+   * <p>
+   * On a runtime that hands a new thread the identity of whoever created it, a
+   * worker kept across submissions made by two different identities reports the
+   * one it was created with; that belongs to the thread this executor makes for
+   * itself and is left exactly as it is.
    *
    * @throws Exception if a task fails or a wait times out
    */
@@ -771,57 +792,77 @@ public class TestExecutorSubjectPropagation {
       throws Exception {
     Subject first = newSubject("blocking-first@EXAMPLE.COM");
     Subject second = newSubject("blocking-second@EXAMPLE.COM");
-    ExecutorService pool = register(BlockingThreadPoolExecutorService
+    ExecutorService reused = register(BlockingThreadPoolExecutorService
         .newInstance(1, 1, 10, TimeUnit.MINUTES, "blocking-reuse"));
+    ExecutorService owned = register(BlockingThreadPoolExecutorService
+        .newInstance(1, 1, 10, TimeUnit.MINUTES, "blocking-owned"));
 
-    Subject observedByFirst = submissionObserves(first, pool);
-    Subject observedBySecond = submissionObserves(second, pool);
+    Subject observedByFirst = submissionObserves(first, reused);
+    Subject observedByFirstAgain = submissionObserves(first, reused);
+    Subject observedBySecond = submissionObserves(second, owned);
 
     assertSame(first, observedByFirst,
         "the first task submitted did not observe its own submitter");
+    assertSame(first, observedByFirstAgain,
+        "a task run by a reused blocking-pool worker did not observe its own "
+            + "submitter");
     assertSame(second, observedBySecond,
-        "a task run by a reused blocking-pool worker observed the identity of "
-            + "an earlier submitter instead of its own");
+        "a task submitted to a blocking pool by a second identity did not "
+            + "observe that identity");
   }
 
   /**
-   * A task submitted with no identity runs with none, rather than adopting the
-   * identity its worker was left holding.
+   * A task prepared for a submitter that carries no identity is handed on
+   * untouched, so that running it inside a scope that does carry one leaves
+   * that one in force.
    * <p>
-   * The worker is created inside a scope that establishes an identity, so the
-   * worker carries it for as long as it lives; the second submission is then
-   * made from a thread carrying nothing. Letting that task run as the worker
-   * would run one caller's work as another user, which decides authorization
-   * and is what an audit record names, so the absence of an identity is
-   * carried across just as deliberately as an identity is. Both kinds of
-   * worker that hold an identity of their own are covered.
+   * Carrying an identity into a task means establishing one for as long as the
+   * task runs, and establishing an absent identity is not the same as
+   * establishing nothing at all: a scope that establishes an absent identity
+   * hides whatever was established around it. A submission made with nothing to
+   * carry therefore has to be left as it was, or a task could find itself
+   * running as nobody in a scope that had an identity of its own to offer it,
+   * which decides authorization and is what an audit record names. Both of the
+   * kinds of task an executor accepts are covered.
+   * <p>
+   * Preparing each task from a thread carrying nothing and then running it
+   * inside a scope that carries an identity is what makes the difference
+   * visible: a task that had been given an absent identity of its own would
+   * report none, whereas one left as it was reports the scope's.
    *
    * @throws Exception if a task fails or a wait times out
    */
   @Test
   @Timeout(value = 30)
-  public void testSubjectlessSubmissionDoesNotAdoptTheWorkerSubject()
+  public void testSubjectlessSubmissionDoesNotHideAnEnclosingSubject()
       throws Exception {
-    Subject worker = newSubject("worker-identity@EXAMPLE.COM");
+    Subject enclosing = newSubject("enclosing-identity@EXAMPLE.COM");
+    final Callable<Subject> preparedCallable =
+        SubjectPreservingTasks.wrap(currentSubject());
+    final SubjectRecorder recorder = new SubjectRecorder(1);
+    final Runnable preparedRunnable = SubjectPreservingTasks.wrap(recorder);
 
-    ExecutorService inheriting = register(HadoopExecutors.newFixedThreadPool(
-        1, BlockingThreadPoolExecutorService.newDaemonThreadFactory("held")));
-    assertSame(worker, submissionObserves(worker, inheriting),
-        "the task that created the worker did not observe its own submitter");
-    assertNull(inheriting.submit(currentSubject())
-            .get(TIMEOUT_SECONDS, TimeUnit.SECONDS),
-        "a task submitted with no identity adopted the identity its worker "
-            + "was holding");
+    Subject observedByCallable =
+        SubjectUtil.callAs(enclosing, new Callable<Subject>() {
+          @Override
+          public Subject call() throws Exception {
+            return preparedCallable.call();
+          }
+        });
+    SubjectUtil.callAs(enclosing, new Callable<Void>() {
+      @Override
+      public Void call() {
+        preparedRunnable.run();
+        return (Void) null;
+      }
+    });
 
-    ExecutorService daemons = register(HadoopExecutors.newFixedThreadPool(
-        1, new Daemon.DaemonFactory()));
-    assertSame(worker, submissionObserves(worker, daemons),
-        "the task that created the daemon worker did not observe its own "
-            + "submitter");
-    assertNull(daemons.submit(currentSubject())
-            .get(TIMEOUT_SECONDS, TimeUnit.SECONDS),
-        "a task submitted with no identity adopted the identity its daemon "
-            + "worker was holding");
+    assertSame(enclosing, observedByCallable,
+        "a callable prepared with no identity hid the identity of the scope "
+            + "it ran in");
+    assertSame(enclosing, awaitSingleRun(recorder),
+        "a task prepared with no identity hid the identity of the scope it "
+            + "ran in");
   }
 
   /**
@@ -918,6 +959,14 @@ public class TestExecutorSubjectPropagation {
   /**
    * Returns a fresh semaphored executor over a pool of its own.
    * <p>
+   * The pool it forwards to is a plain one, made here rather than through any of
+   * Hadoop's factories and given plain threads, so it neither carries an
+   * identity with a task nor hands one to a worker it creates. That leaves the
+   * semaphored executor's own handling of the task as the only thing an
+   * assertion about the identity a task observed can be reading, which is what
+   * makes such an assertion a statement about this executor rather than about
+   * whatever it happens to forward to.
+   * <p>
    * Both the executor and the pool it forwards to are shut down when the test
    * ends, and each caller gets its own so that a worker is always created by
    * the submission being asserted on.
@@ -927,8 +976,9 @@ public class TestExecutorSubjectPropagation {
    */
   private SemaphoredDelegatingExecutor newSemaphored(String prefix) {
     return register(new SemaphoredDelegatingExecutor(
-        register(HadoopExecutors.newFixedThreadPool(
-            1, new PlainDaemonThreadFactory("semaphored-" + prefix))),
+        register(new ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS,
+            new LinkedBlockingQueue<Runnable>(),
+            new PlainDaemonThreadFactory("semaphored-" + prefix))),
         2, false));
   }
 

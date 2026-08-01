@@ -36,7 +36,6 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
 import org.apache.hadoop.classification.VisibleForTesting;
 import org.apache.hadoop.util.Preconditions;
 import org.apache.hadoop.util.concurrent.HadoopThreadPoolExecutor;
-import org.apache.hadoop.util.concurrent.SubjectPreservingTasks;
 import org.apache.hadoop.thirdparty.com.google.common.cache.CacheBuilder;
 import org.apache.hadoop.thirdparty.com.google.common.cache.CacheLoader;
 import org.apache.hadoop.thirdparty.com.google.common.cache.LoadingCache;
@@ -97,44 +96,13 @@ public class ValueQueue <E> {
 
   /**
    * A <code>Runnable</code> which takes a string name.
-   * <p>
-   * A refill task is put straight into the queue that backs the filler pool
-   * instead of being submitted through the pool, so the pool never gets the
-   * chance to carry the queueing thread's JAAS subject over to the filler
-   * thread that runs the task. That subject is therefore read here, in a
-   * constructor that runs on the queueing thread, and {@link #fill()} is run
-   * through the task {@link SubjectPreservingTasks#wrap(Runnable)} hands back.
-   * A refill then reaches the key provider as the caller whose request made it
-   * necessary, or as nobody at all when that caller had no identity, rather
-   * than as whoever happened to cause a filler thread to be created.
-   * <p>
-   * What goes into the queue is still a <code>NamedRunnable</code>, which is
-   * what the queue's tracking of the keys being filled, {@link #cancel()} and
-   * the removal in {@link ValueQueue#drain(String)} all rely on.
    */
   private abstract static class NamedRunnable implements Runnable {
     final String name;
     private AtomicBoolean canceled = new AtomicBoolean(false);
-    /** {@link #fill()} bound to the identity that queued this task. */
-    private final Runnable subjectPreservingFill;
-
     private NamedRunnable(String keyName) {
       this.name = keyName;
-      this.subjectPreservingFill = SubjectPreservingTasks.wrap(this::fill);
     }
-
-    /**
-     * Fills the queue for this task's key under the identity that queued it.
-     */
-    @Override
-    public final void run() {
-      subjectPreservingFill.run();
-    }
-
-    /**
-     * Fills the queue for this task's key.
-     */
-    abstract void fill();
 
     public void cancel() {
       canceled.set(true);
@@ -183,12 +151,6 @@ public class ValueQueue <E> {
    *
    * NOTE: Only methods that ware explicitly called by the
    * <code>ThreadPoolExecutor</code> need to be over-ridden.
-   *
-   * A task reaches this Queue already prepared to run under the JAAS subject of
-   * the thread that submitted it. Every element is kept, handed back and
-   * removed exactly as it arrived, so that the executor and this Queue both
-   * find it again by identity, and <code>SubjectPreservingTasks.unwrap</code>
-   * is used only to read the name of a task, and to cancel it.
    */
   private static class UniqueKeyBlockingQueue extends
       LinkedBlockingQueue<Runnable> {
@@ -196,19 +158,10 @@ public class ValueQueue <E> {
     private static final long serialVersionUID = -2152747693695890371L;
     private HashMap<String, Runnable> keysInProgress = new HashMap<>();
 
-    /**
-     * Returns the named refill task carried by <code>r</code>, which is
-     * <code>r</code> itself unless it has been given a subject to run under.
-     */
-    private static NamedRunnable named(Runnable r) {
-      return (NamedRunnable) SubjectPreservingTasks.unwrap(r);
-    }
-
     @Override
     public synchronized void put(Runnable e) throws InterruptedException {
-      String keyName = named(e).name;
-      if (!keysInProgress.containsKey(keyName)) {
-        keysInProgress.put(keyName, e);
+      if (!keysInProgress.containsKey(((NamedRunnable)e).name)) {
+        keysInProgress.put(((NamedRunnable)e).name, e);
         super.put(e);
       }
     }
@@ -217,7 +170,7 @@ public class ValueQueue <E> {
     public Runnable take() throws InterruptedException {
       Runnable k = super.take();
       if (k != null) {
-        keysInProgress.remove(named(k).name);
+        keysInProgress.remove(((NamedRunnable)k).name);
       }
       return k;
     }
@@ -227,15 +180,15 @@ public class ValueQueue <E> {
         throws InterruptedException {
       Runnable k = super.poll(timeout, unit);
       if (k != null) {
-        keysInProgress.remove(named(k).name);
+        keysInProgress.remove(((NamedRunnable)k).name);
       }
       return k;
     }
 
     public Runnable deleteByName(String name) {
-      Runnable e = keysInProgress.remove(name);
+      NamedRunnable e = (NamedRunnable) keysInProgress.remove(name);
       if (e != null) {
-        named(e).cancel();
+        e.cancel();
         super.remove(e);
       }
       return e;
@@ -473,23 +426,11 @@ public class ValueQueue <E> {
     }
     // The submit/execute method of the ThreadPoolExecutor is bypassed and
     // the Runnable is directly put in the backing BlockingQueue so that we
-    // can control exactly how the runnable is inserted into the queue. That
-    // also bypasses the point at which the pool would carry this thread's
-    // JAAS subject over to the filler thread, which NamedRunnable therefore
-    // takes care of itself, as it is created here on this thread. A refiller
-    // runs as the user whose request emptied the queue, rather than as no user
-    // at all, and what goes into the queue is still the NamedRunnable itself,
-    // so key de-duplication and the object identity that drain() relies on are
-    // unaffected.
+    // can control exactly how the runnable is inserted into the queue.
     queue.put(
         new NamedRunnable(keyName) {
-
-          /**
-           * Refills the queue for the key this task names, unless the task was
-           * cancelled or the queue has meanwhile risen back to the watermark.
-           */
           @Override
-          void fill() {
+          public void run() {
             int cacheSize = numValues;
             int threshold = (int) (lowWatermark * (float) cacheSize);
             // Need to ensure that only one refill task per key is executed
@@ -510,7 +451,8 @@ public class ValueQueue <E> {
               throw new RuntimeException(e);
             }
           }
-        });
+        }
+        );
   }
 
   /**

@@ -45,13 +45,14 @@ import static java.util.Objects.requireNonNull;
  * keeps a pool correct when one reused worker serves several submitters.
  * <p>
  * Nothing else is altered. Every other call goes straight to the wrapped
- * service, which keeps its own behaviour in full. The one place where
- * forwarding alone would not be faithful is
- * {@link #shutdownNow()}: the wrapped service holds the tasks this class
- * prepared for it and hands those back, so they are returned in the form they
- * were submitted in, which is what a caller asking for its unstarted work is
- * owed. This class adds the propagation of an identity and changes nothing
- * besides.
+ * service, which keeps its own behaviour in full, and its lifecycle in
+ * particular is left exactly as it is: what
+ * {@link java.util.concurrent.ExecutorService#shutdownNow()} hands back is the
+ * wrapped service's own list of tasks that never started, untouched. Code that
+ * needs one of those tasks as it was submitted calls
+ * {@link SubjectPreservingTasks#unwrap(Runnable)} on it. This class adds the
+ * propagation of an identity and changes nothing besides.
+ * <p>
  * The bulk methods copy the tasks into a new list in iteration order, so the
  * collection passed in is left as it was and the futures returned line up with
  * it one for one.
@@ -62,11 +63,14 @@ import static java.util.Objects.requireNonNull;
  * see into, with particular semantics it has deliberately not reproduced;
  * forwarding adds the propagation and leaves those semantics untouched.
  * <p>
- * Such a service is what this is for. A pool Hadoop owns already prepares the
- * tasks handed to it, so placing this in front of one adds a step that pool
- * does not need; it is harmless, because
- * {@link SubjectPreservingTasks#wrap(Runnable)} hands back a task that is
- * already prepared, but there is nothing to gain from it.
+ * Such a service is what this class is for, and the only thing it is for. It is
+ * not a general way to add propagation in front of an arbitrary executor: a pool
+ * Hadoop owns already prepares the tasks handed to it, and putting this in front
+ * of one would not merely be redundant. A task prepared here and then submitted
+ * with {@link ExecutorService#submit(Runnable)} reaches that pool inside a new
+ * future the pool builds around it, which the pool prepares in turn, so the task
+ * would end up behind two layers where
+ * {@link SubjectPreservingTasks#unwrap(Runnable)} takes one back off.
  */
 @InterfaceAudience.Private
 public class SubjectPreservingExecutorService extends ForwardingExecutorService {
@@ -87,21 +91,6 @@ public class SubjectPreservingExecutorService extends ForwardingExecutorService 
   @Override
   protected ExecutorService delegate() {
     return delegate;
-  }
-
-  /**
-   * Stops the wrapped service at once and returns the tasks that had not
-   * started, as they were submitted.
-   * <p>
-   * The wrapped service queued the tasks this class prepared for it, and hands
-   * those back. A caller is owed what it submitted, so each one is returned in
-   * that form; the wrapped service's own shutdown behaviour is untouched.
-   *
-   * @return the tasks that never started, each as it was submitted
-   */
-  @Override
-  public List<Runnable> shutdownNow() {
-    return SubjectPreservingTasks.unwrapAll(super.shutdownNow());
   }
 
   /**

@@ -62,11 +62,14 @@ public class HadoopScheduledThreadPoolExecutor extends
    * Schedules a task to run once, under the subject of the calling thread.
    * <p>
    * The subject is read here, on the scheduling thread, rather than when a
-   * worker thread is created, so the task runs as whoever scheduled it even on
-   * a pool that reuses its threads, and runs under no identity at all when
-   * whoever scheduled it had none. {@link SubjectPreservingTasks} describes why
-   * an identity has to be carried across a thread boundary this way, and why it
-   * is carried for every task rather than only for some.
+   * worker thread is created, so the task runs as whoever scheduled it even on a
+   * pool that reuses its threads. Two kinds of scheduling need nothing read for
+   * them and are handed straight on: one made on a runtime that gives a thread
+   * the identity of the thread that starts it, and one made by a thread that
+   * holds no identity, since binding an absent identity would take the place of
+   * whatever the code that goes on to run the task would otherwise have
+   * observed. {@link SubjectPreservingTasks} describes both, and why an identity
+   * has to be carried across a thread boundary this way.
    *
    * @param command the task to run
    * @param delay how long to wait before the task runs
@@ -85,9 +88,11 @@ public class HadoopScheduledThreadPoolExecutor extends
    * thread.
    * <p>
    * This is the {@link Callable} counterpart of
-   * {@link #schedule(Runnable, long, TimeUnit)} and captures the subject on
-   * the same terms. An exception the task throws reaches the returned future
-   * with its own type, unchanged.
+   * {@link #schedule(Runnable, long, TimeUnit)} and reads the subject on the same
+   * terms. A future reports a failed task through an
+   * {@link java.util.concurrent.ExecutionException}, and the exception the task
+   * threw becomes the direct cause of that, with no further exception wrapping it
+   * for a caller to unwrap.
    *
    * @param <V> the result type of the task
    * @param callable the task to call

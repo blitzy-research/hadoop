@@ -130,10 +130,15 @@ public final class SubjectUtil {
    * risking its loss. Code that only needs to carry the subject across a boundary
    * the JVM no longer crosses for it can guard on this flag and so reduce to a
    * provable no-op on JDK 17.
-   * Handing a task to a thread that already exists is not that boundary: no
-   * runtime gives such a task the subject of whoever submitted it, so this flag
-   * does not answer that question and code crossing that boundary has to carry
-   * the subject itself on every runtime.
+   * Handing a task to a thread that already exists is a different boundary, and
+   * this flag does not report on it: no runtime hands such a task the subject of
+   * whoever submitted it. Code that carries the subject across that boundary still
+   * bypasses its own work where this flag is {@code true}, because a runtime that
+   * copies the subject into every thread it creates has already given the worker a
+   * subject to run under; and it bypasses it again when
+   * {@link #current()} finds nothing, because passing that {@code null} on would
+   * take the place of the subject of an enclosing scope instead of leaving it
+   * alone.
    */
   public static final boolean THREAD_INHERITS_SUBJECT = checkThreadInheritsSubject();
 

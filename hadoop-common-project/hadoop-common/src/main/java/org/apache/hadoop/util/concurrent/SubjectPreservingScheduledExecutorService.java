@@ -34,9 +34,8 @@ import java.util.concurrent.TimeUnit;
  * {@link SubjectPreservingTasks} on its way in, always on the thread doing the
  * scheduling, so a task runs under the identity of whoever scheduled it rather
  * than the identity current when a worker was created. The inherited submission
- * methods cover every other way a task can be handed over, and because this
- * class forwards to a separate service rather than routing back through itself,
- * every task is wrapped exactly once whichever way it arrives.
+ * methods cover every other way a task can be handed over to the service this
+ * class wraps.
  * <p>
  * A repeating task re-establishes the subject of the thread that scheduled it on
  * every one of its executions, for as long as it goes on repeating: the subject
@@ -55,12 +54,13 @@ import java.util.concurrent.TimeUnit;
  * from {@link java.util.concurrent.Executors} are implementations Hadoop cannot
  * see into, with particular semantics it has deliberately not reproduced.
  * <p>
- * Only such a service needs to be wrapped. A pool Hadoop owns, such as
- * {@link HadoopScheduledThreadPoolExecutor}, already carries the identity into
- * the tasks handed to it, so placing this in front of one would ask for the
- * same thing twice: {@link SubjectPreservingTasks#wrap(Runnable)} hands back a task it
- * has already prepared, so nothing is layered twice and nothing that reports on
- * a task is misled, but the second request buys nothing either.
+ * Such a service is the only thing this class is for. A pool Hadoop owns, such
+ * as {@link HadoopScheduledThreadPoolExecutor}, already carries the identity
+ * into the tasks handed to it, and putting this in front of one would not merely
+ * be redundant: a task prepared here and then submitted rather than scheduled
+ * reaches that pool inside a new future the pool builds around it, which the
+ * pool prepares in turn, leaving the task behind two layers where
+ * {@link SubjectPreservingTasks#unwrap(Runnable)} takes one back off.
  */
 @InterfaceAudience.Private
 public class SubjectPreservingScheduledExecutorService

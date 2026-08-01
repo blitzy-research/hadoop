@@ -36,17 +36,18 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
 /**
- * Asserts that a thread created through Hadoop's own thread utilities observes the
- * Subject of the thread that created it.
+ * Asserts that a thread created and started through Hadoop's own thread utilities
+ * observes the Subject of the thread that created and started it.
  * <p>
  * The utilities exercised here are {@link SubjectInheritingThread}, {@link Daemon},
  * and the two thread factories built on them, {@link Daemon.DaemonFactory} and
- * {@link BlockingThreadPoolExecutorService#newDaemonThreadFactory(String)}. All of
- * them already carry the Subject across correctly, so this class is not uncovering a
- * defect; it pins the guarantee down, so that a later change to any of them cannot
- * drop the identity quietly. Dropping it still compiles, throws nothing and logs
- * nothing, and shows up only much later as a denied authorization or an anonymous
- * audit record, which is precisely why the guarantee is worth asserting directly.
+ * {@link BlockingThreadPoolExecutorService#newDaemonThreadFactory(String)}. Each of
+ * them owes that guarantee to its callers, and losing it is silent: the code still
+ * compiles, throws nothing and logs nothing, while the work runs under no identity at
+ * all. An identity is what decides an authorization and what an audit record names,
+ * so work that runs without one is denied where it should be allowed, or recorded
+ * against nobody. That is why the guarantee is asserted here directly, rather than
+ * inferred from the behaviour of anything built on top of it.
  * <p>
  * Every assertion below is an outcome, namely the Subject that the new thread
  * observes, and never the mechanism that delivers it. That mechanism is not the same
@@ -122,11 +123,15 @@ public class TestThreadFactorySubjectPropagation {
    * Asserts that the thread under test finished, and that it observed the Subject
    * established on the thread which created it.
    * <p>
-   * Termination is checked first, and deliberately so. {@link Thread#join(long)} can
-   * return because its timeout expired rather than because the thread ended, and it
-   * is the thread ending that makes what the thread wrote visible to this one.
-   * Checking it first reports a thread that overran directly, instead of leaving it
-   * to be diagnosed from the empty observation it would otherwise leave behind.
+   * Two separate things are needed here, and they are checked in that order. What
+   * the thread under test observed reaches this thread through an
+   * {@link AtomicReference}, which is what publishes the value from the one thread to
+   * the other. Whether the thread got as far as writing it is a different question,
+   * and {@link Thread#join(long)} does not answer it: join returns as readily because
+   * its timeout expired as because the thread ended. Asserting that the thread is no
+   * longer alive is what answers it, and asserting that first reports a thread that
+   * overran as exactly that, instead of leaving it to be diagnosed from the empty
+   * observation it would otherwise leave behind.
    * <p>
    * The Subject is then compared by identity rather than by equality, which is both
    * available and exact here: the utilities re-establish the very instance they were
@@ -144,10 +149,6 @@ public class TestThreadFactorySubjectPropagation {
         "thread under test did not observe the creating thread's Subject");
   }
 
-  /**
-   * A no-argument {@link SubjectInheritingThread} whose payload is supplied by
-   * overriding {@link SubjectInheritingThread#work()}.
-   */
   @Test
   @Timeout(value = 30)
   public void testSubjectInheritingThreadWorkOverride() {
@@ -173,10 +174,6 @@ public class TestThreadFactorySubjectPropagation {
     assertObservedCreatorSubject(creator, observed, worker);
   }
 
-  /**
-   * A {@link SubjectInheritingThread} whose payload is a Runnable passed to the
-   * constructor.
-   */
   @Test
   @Timeout(value = 30)
   public void testSubjectInheritingThreadRunnableTarget() {
@@ -204,10 +201,6 @@ public class TestThreadFactorySubjectPropagation {
     assertObservedCreatorSubject(creator, observed, worker);
   }
 
-  /**
-   * A {@link SubjectInheritingThread} created in an explicit thread group, with its
-   * payload passed as a Runnable.
-   */
   @Test
   @Timeout(value = 30)
   public void testSubjectInheritingThreadGroupedRunnableTarget() {
@@ -236,9 +229,6 @@ public class TestThreadFactorySubjectPropagation {
     assertObservedCreatorSubject(creator, observed, worker);
   }
 
-  /**
-   * A named {@link SubjectInheritingThread} with its payload passed as a Runnable.
-   */
   @Test
   @Timeout(value = 30)
   public void testSubjectInheritingThreadNamedRunnableTarget() {
@@ -266,10 +256,6 @@ public class TestThreadFactorySubjectPropagation {
     assertObservedCreatorSubject(creator, observed, worker);
   }
 
-  /**
-   * A named {@link SubjectInheritingThread} created in an explicit thread group, with
-   * its payload passed as a Runnable.
-   */
   @Test
   @Timeout(value = 30)
   public void testSubjectInheritingThreadGroupedNamedRunnableTarget() {
@@ -298,10 +284,6 @@ public class TestThreadFactorySubjectPropagation {
     assertObservedCreatorSubject(creator, observed, worker);
   }
 
-  /**
-   * A named {@link SubjectInheritingThread} that takes no Runnable, so its payload
-   * has to be supplied by overriding {@link SubjectInheritingThread#work()}.
-   */
   @Test
   @Timeout(value = 30)
   public void testSubjectInheritingThreadNamedWorkOverride() {
@@ -327,11 +309,6 @@ public class TestThreadFactorySubjectPropagation {
     assertObservedCreatorSubject(creator, observed, worker);
   }
 
-  /**
-   * A named {@link SubjectInheritingThread} in an explicit thread group that takes no
-   * Runnable, so its payload has to be supplied by overriding
-   * {@link SubjectInheritingThread#work()}.
-   */
   @Test
   @Timeout(value = 30)
   public void testSubjectInheritingThreadGroupedNamedWorkOverride() {
@@ -358,10 +335,6 @@ public class TestThreadFactorySubjectPropagation {
     assertObservedCreatorSubject(creator, observed, worker);
   }
 
-  /**
-   * A no-argument {@link Daemon} whose payload is supplied by overriding
-   * {@link Daemon#work()}.
-   */
   @Test
   @Timeout(value = 30)
   public void testDaemonWorkOverride() {
@@ -388,9 +361,6 @@ public class TestThreadFactorySubjectPropagation {
     assertTrue(worker.get().isDaemon(), "Daemon was not created as a daemon thread");
   }
 
-  /**
-   * A {@link Daemon} whose payload is a Runnable passed to the constructor.
-   */
   @Test
   @Timeout(value = 30)
   public void testDaemonRunnableTarget() {
@@ -419,10 +389,6 @@ public class TestThreadFactorySubjectPropagation {
     assertTrue(worker.get().isDaemon(), "Daemon was not created as a daemon thread");
   }
 
-  /**
-   * A {@link Daemon} created in an explicit thread group, with its payload passed as
-   * a Runnable.
-   */
   @Test
   @Timeout(value = 30)
   public void testDaemonGroupedRunnableTarget() {
@@ -453,9 +419,6 @@ public class TestThreadFactorySubjectPropagation {
   }
 
   /**
-   * A thread obtained from {@link Daemon.DaemonFactory}, the thread factory Hadoop
-   * hands to executor constructors.
-   * <p>
    * The factory is asked for the thread inside the establishing scope, which is where
    * production code asks for one: the factory call is the moment the thread comes
    * into existence, so it is the moment the identity has to be available.
@@ -491,10 +454,6 @@ public class TestThreadFactorySubjectPropagation {
   }
 
   /**
-   * A thread obtained from
-   * {@link BlockingThreadPoolExecutorService#newDaemonThreadFactory(String)}, the
-   * named daemon thread factory that Hadoop's blocking thread pool is built on.
-   * <p>
    * As with the other factory, the thread is requested inside the establishing scope.
    * That this factory also guarantees a daemon thread is asserted as well, since that
    * is part of what it promises its callers.

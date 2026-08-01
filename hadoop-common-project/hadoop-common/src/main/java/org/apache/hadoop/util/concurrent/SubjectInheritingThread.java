@@ -83,8 +83,8 @@ public class SubjectInheritingThread extends Thread {
    * Behaves similarly to {@link Thread#Thread(ThreadGroup, Runnable)}
    * constructor.
    *
-   * @param group  the thread group. If {@code null}, the group is set to the
-   *               current thread's thread group.
+   * @param group  the thread group. When {@code null}, the group is chosen as
+   *               the corresponding {@link Thread} constructor chooses it.
    *
    * @param target the object whose {@code run} method is invoked when this thread
    *               is started. If {@code null}, this thread's run method is
@@ -128,8 +128,8 @@ public class SubjectInheritingThread extends Thread {
   /**
    * Behaves similarly to {@link Thread#Thread(ThreadGroup, String)} constructor.
    *
-   * @param group the thread group. If {@code null}, the group is set to the
-   *              current thread's thread group.
+   * @param group the thread group. When {@code null}, the group is chosen as the
+   *              corresponding {@link Thread} constructor chooses it.
    *
    * @param name  the name of the new thread
    */
@@ -141,8 +141,8 @@ public class SubjectInheritingThread extends Thread {
    * Behaves similarly to {@link Thread#Thread(ThreadGroup, Runnable, String)}
    * constructor.
    *
-   * @param group  the thread group. If {@code null}, the group is set to the
-   *               current thread's thread group.
+   * @param group  the thread group. When {@code null}, the group is chosen as
+   *               the corresponding {@link Thread} constructor chooses it.
    *
    * @param target the object whose {@code run} method is invoked when this thread
    *               is started. If {@code null}, this thread's run method is
