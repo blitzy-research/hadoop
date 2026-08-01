@@ -24,6 +24,7 @@ import org.apache.hadoop.thirdparty.com.google.common.util.concurrent.Futures;
 import org.apache.hadoop.classification.InterfaceAudience;
 import org.apache.hadoop.fs.statistics.DurationTracker;
 import org.apache.hadoop.fs.statistics.DurationTrackerFactory;
+import org.apache.hadoop.util.concurrent.SubjectPreservingTasks;
 
 import java.util.Collection;
 import java.util.List;
@@ -134,7 +135,7 @@ public class SemaphoredDelegatingExecutor extends
       Thread.currentThread().interrupt();
       return Futures.immediateFailedFuture(e);
     }
-    return super.submit(new CallableWithPermitRelease<>(task));
+    return super.submit(new CallableWithPermitRelease<>(SubjectPreservingTasks.wrap(task)));
   }
 
   @Override
@@ -146,7 +147,7 @@ public class SemaphoredDelegatingExecutor extends
       Thread.currentThread().interrupt();
       return Futures.immediateFailedFuture(e);
     }
-    return super.submit(new RunnableWithPermitRelease(task), result);
+    return super.submit(new RunnableWithPermitRelease(SubjectPreservingTasks.wrap(task)), result);
   }
 
   @Override
@@ -158,7 +159,7 @@ public class SemaphoredDelegatingExecutor extends
       Thread.currentThread().interrupt();
       return Futures.immediateFailedFuture(e);
     }
-    return super.submit(new RunnableWithPermitRelease(task));
+    return super.submit(new RunnableWithPermitRelease(SubjectPreservingTasks.wrap(task)));
   }
 
   @Override
@@ -169,7 +170,7 @@ public class SemaphoredDelegatingExecutor extends
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
     }
-    super.execute(new RunnableWithPermitRelease(command));
+    super.execute(new RunnableWithPermitRelease(SubjectPreservingTasks.wrap(command)));
   }
 
   /**
