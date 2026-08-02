@@ -178,12 +178,21 @@ public class TestNestedSubjectPropagation {
    * being taken back down again would show up. Each reading is asserted both as
    * an identity and by the name of its user, so that neither a second identity
    * carrying the same name nor the same identity renamed could satisfy it.
+   * <p>
+   * A fifth reading is taken on this thread before the outer scope is entered
+   * and asserted again once it has been left. Asserting merely that the outer
+   * identity is gone would be satisfied by any other identity taking its place,
+   * the inner one included, so the identity that was in force beforehand is
+   * captured and required back exactly: an identity that leaked out of a scope
+   * is what would leave a later caller running as a user it never asked for.
    *
    * @throws Exception if a task fails or a wait times out
    */
   @Test
   @Timeout(value = 30)
   public void testNestedDoAsAcrossAPooledTask() throws Exception {
+    final UserGroupInformation beforeOuter =
+        UserGroupInformation.getCurrentUser();
     final UserGroupInformation outer =
         UserGroupInformation.createRemoteUser(OUTER_USER);
     final UserGroupInformation inner =
@@ -237,6 +246,13 @@ public class TestNestedSubjectPropagation {
         "level 4: the identity that was restored was a user of another name");
     assertNotEquals(outer, UserGroupInformation.getCurrentUser(),
         "the outer identity outlived the scope that established it");
+    assertEquals(beforeOuter, UserGroupInformation.getCurrentUser(),
+        "level 5: leaving the outermost scope did not give back exactly the "
+            + "identity that had been in force before it was entered");
+    assertEquals(beforeOuter.getUserName(),
+        UserGroupInformation.getCurrentUser().getUserName(),
+        "level 5: the identity left in force after the outermost scope was a "
+            + "user of another name");
   }
 
   /**
@@ -247,12 +263,19 @@ public class TestNestedSubjectPropagation {
    * This is the case with no executor in it at all, so a failure here says that
    * nesting itself is wrong rather than that an identity failed to cross a
    * thread boundary, which is what tells the two apart.
+   * <p>
+   * The identity in force before the outermost scope is entered is captured and
+   * required back exactly once it has been left, so that an identity outliving
+   * the scope that established it is caught here too rather than only where a
+   * pool is involved.
    *
    * @throws Exception if an identity cannot be read
    */
   @Test
   @Timeout(value = 30)
   public void testNestedDoAsOnOneThread() throws Exception {
+    final UserGroupInformation beforeOuter =
+        UserGroupInformation.getCurrentUser();
     final UserGroupInformation outer =
         UserGroupInformation.createRemoteUser(OUTER_USER);
     final UserGroupInformation inner =
@@ -277,6 +300,16 @@ public class TestNestedSubjectPropagation {
         return null;
       }
     });
+
+    assertNotEquals(outer, UserGroupInformation.getCurrentUser(),
+        "the outer identity outlived the scope that established it");
+    assertEquals(beforeOuter, UserGroupInformation.getCurrentUser(),
+        "leaving the outermost scope did not give back exactly the identity "
+            + "that had been in force before it was entered");
+    assertEquals(beforeOuter.getUserName(),
+        UserGroupInformation.getCurrentUser().getUserName(),
+        "the identity left in force after the outermost scope was a user of "
+            + "another name");
   }
 
   /**

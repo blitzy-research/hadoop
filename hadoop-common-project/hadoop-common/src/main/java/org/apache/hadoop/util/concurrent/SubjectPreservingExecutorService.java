@@ -22,7 +22,6 @@ import org.apache.hadoop.thirdparty.com.google.common.util.concurrent.Forwarding
 
 import org.apache.hadoop.classification.InterfaceAudience;
 
-import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.concurrent.Callable;
@@ -38,24 +37,32 @@ import static java.util.Objects.requireNonNull;
  * An executor service that carries the submitting thread's JAAS subject into
  * every task it passes to the executor service it wraps.
  * <p>
- * Each task goes through {@link SubjectPreservingTasks#wrap(Runnable)} or
- * {@link SubjectPreservingTasks#wrap(Callable)} on its way in, and always on
- * the submitting thread, so a task runs under the identity of its own submitter
- * rather than the identity current when a worker was created. That is what
- * keeps a pool correct when one reused worker serves several submitters.
+ * Each task goes through
+ * {@link SubjectPreservingTasks#wrap(Runnable)} or
+ * {@link SubjectPreservingTasks#wrap(Callable)} on its way in, and
+ * always on the submitting thread, so a task runs under the identity of its own
+ * submitter rather than the identity current when a worker was created. That is
+ * what keeps a pool correct when one reused worker serves several submitters,
+ * and a submission made with no identity at all runs under none rather than
+ * under whatever identity its worker was left holding.
  * <p>
  * Nothing else is altered. Every other call goes straight to the wrapped
- * service, which keeps its own behaviour in full, and its lifecycle in
- * particular is left exactly as it is: what
- * {@link java.util.concurrent.ExecutorService#shutdownNow()} hands back is the
- * wrapped service's own list of tasks that never started, untouched. Code that
- * needs one of those tasks as it was submitted calls
- * {@link SubjectPreservingTasks#unwrap(Runnable)} on it. This class adds the
- * propagation of an identity and changes nothing besides.
+ * service, which keeps its own behaviour in full. The one place where forwarding
+ * alone would not be enough is
+ * {@link java.util.concurrent.ExecutorService#shutdownNow()}: the wrapped
+ * service gives back the tasks it never started in the form they were queued in,
+ * which is the prepared form, and a caller shutting a pool down is owed the
+ * tasks it submitted. They are therefore returned as they were handed over, so
+ * that no caller has to know that anything was prepared at all.
  * <p>
- * The bulk methods copy the tasks into a new list in iteration order, so the
- * collection passed in is left as it was and the futures returned line up with
- * it one for one.
+ * The methods that take a whole collection of tasks hand the wrapped service a
+ * view of it, through {@link SubjectPreservingTasks#wrapEach(Collection)},
+ * rather than a list prepared in advance. The wrapped service therefore reads
+ * the collection itself, and keeps sole charge of what that means: a wait it was
+ * given still covers the reading, it still hands over only as many tasks as it
+ * needs, and it still refuses a collection it would have refused before. The
+ * collection passed in is left as it was, and the futures returned line up with
+ * it one for one, in its order.
  * <p>
  * It forwards rather than extends because {@link HadoopThreadPoolExecutor} is
  * final, and because the single-thread services {@link HadoopExecutors} obtains
@@ -140,8 +147,30 @@ public class SubjectPreservingExecutorService extends ForwardingExecutorService 
   }
 
   /**
+   * Stops the wrapped service at once and returns the tasks that never started,
+   * as they were submitted.
+   * <p>
+   * The wrapped service hands them back in the form it queued them in, which is
+   * the form this class prepared, so each is returned to the form it arrived in.
+   * A caller shutting a pool down is owed the tasks it handed over, so that it
+   * can run them elsewhere or report on them; leaving them prepared would make
+   * every such caller responsible for undoing a detail of this class, and one
+   * that did not know to would be holding tasks it could not identify.
+   *
+   * @return the tasks that never started, each as it was submitted
+   */
+  @Override
+  public List<Runnable> shutdownNow() {
+    return SubjectPreservingTasks.unwrapAll(super.shutdownNow());
+  }
+
+  /**
    * Runs every one of the given tasks under the subject current on this
    * thread, and returns once all of them have finished.
+   * <p>
+   * The tasks are prepared as the wrapped service reaches them, so it reads the
+   * collection given here itself and keeps sole charge of the order in which it
+   * hands the tasks over.
    *
    * @param <T> the result type of the tasks
    * @param tasks the tasks to run
@@ -153,17 +182,18 @@ public class SubjectPreservingExecutorService extends ForwardingExecutorService 
   @Override
   public <T> List<Future<T>> invokeAll(Collection<? extends Callable<T>> tasks)
       throws InterruptedException {
-    List<Callable<T>> wrapped = new ArrayList<>(tasks.size());
-    for (Callable<T> task : tasks) {
-      wrapped.add(SubjectPreservingTasks.wrap(task));
-    }
-    return super.invokeAll(wrapped);
+    return super.invokeAll(SubjectPreservingTasks.wrapEach(tasks));
   }
 
   /**
    * Runs every one of the given tasks under the subject current on this
    * thread, and returns once all of them have finished or the wait has run
    * out.
+   * <p>
+   * The wait is the wrapped service's own, measured from the moment it is
+   * called: the tasks are prepared as it reaches them, inside the wait, rather
+   * than beforehand, so the time spent reading the collection counts against
+   * the wait exactly as it does without this class in the way.
    *
    * @param <T> the result type of the tasks
    * @param tasks the tasks to run
@@ -177,16 +207,18 @@ public class SubjectPreservingExecutorService extends ForwardingExecutorService 
   @Override
   public <T> List<Future<T>> invokeAll(Collection<? extends Callable<T>> tasks,
       long timeout, TimeUnit unit) throws InterruptedException {
-    List<Callable<T>> wrapped = new ArrayList<>(tasks.size());
-    for (Callable<T> task : tasks) {
-      wrapped.add(SubjectPreservingTasks.wrap(task));
-    }
-    return super.invokeAll(wrapped, timeout, unit);
+    return super.invokeAll(SubjectPreservingTasks.wrapEach(tasks), timeout,
+        unit);
   }
 
   /**
    * Runs the given tasks under the subject current on this thread and returns
    * the result of one that finished without failing.
+   * <p>
+   * Only as many tasks are handed over as are needed, because they are prepared
+   * as the wrapped service reaches them: it starts with one and takes another
+   * only while none has finished, exactly as it does without this class in the
+   * way.
    *
    * @param <T> the result type of the tasks
    * @param tasks the tasks to run
@@ -197,16 +229,16 @@ public class SubjectPreservingExecutorService extends ForwardingExecutorService 
   @Override
   public <T> T invokeAny(Collection<? extends Callable<T>> tasks)
       throws InterruptedException, ExecutionException {
-    List<Callable<T>> wrapped = new ArrayList<>(tasks.size());
-    for (Callable<T> task : tasks) {
-      wrapped.add(SubjectPreservingTasks.wrap(task));
-    }
-    return super.invokeAny(wrapped);
+    return super.invokeAny(SubjectPreservingTasks.wrapEach(tasks));
   }
 
   /**
    * Runs the given tasks under the subject current on this thread and returns
    * the result of one that finished without failing before the wait ran out.
+   * <p>
+   * As with the untimed form, only as many tasks are handed over as are needed;
+   * and as with the other timed form, the wait is the wrapped service's own and
+   * covers the reading of the collection.
    *
    * @param <T> the result type of the tasks
    * @param tasks the tasks to run
@@ -221,10 +253,7 @@ public class SubjectPreservingExecutorService extends ForwardingExecutorService 
   public <T> T invokeAny(Collection<? extends Callable<T>> tasks, long timeout,
       TimeUnit unit)
       throws InterruptedException, ExecutionException, TimeoutException {
-    List<Callable<T>> wrapped = new ArrayList<>(tasks.size());
-    for (Callable<T> task : tasks) {
-      wrapped.add(SubjectPreservingTasks.wrap(task));
-    }
-    return super.invokeAny(wrapped, timeout, unit);
+    return super.invokeAny(SubjectPreservingTasks.wrapEach(tasks), timeout,
+        unit);
   }
 }

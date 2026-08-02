@@ -61,13 +61,15 @@ its cause.
 A single utility, `org.apache.hadoop.util.concurrent.SubjectPreservingTasks`,
 captures `SubjectUtil.current()` **at task submission** — in the decorator's
 constructor, which runs on the submitting thread — and re-establishes it inside
-the worker. Its entire public surface is three methods:
-`wrap(Runnable)`, `wrap(Callable<T>)` and `unwrap(Runnable)`.
+the worker. Its public surface is `wrap(Runnable)`, `wrap(Callable<T>)`,
+`wrapEach(Collection)` — the form the bulk submission methods need, described
+under [Conflict 5](#Conflict_5_-_The_planned_identity_fast_paths_versus_the_measured_leak)
+— and `unwrap(Runnable)`.
 
 Two properties of that utility are load-bearing:
 
 * **Re-establishment uses `SubjectUtil.doAs`, never `SubjectUtil.callAs`.** `Subject.callAs` is specified to wrap an escaping exception in a `CompletionException`. `SubjectUtil.doAs` unwraps that and rethrows the original cause, which preserves exception identity for `FutureTask`, for every `Future.get()` caller, and for the JDK-8071638 diagnostic in `ExecutorHelper`. Using `callAs` would change the observed type of every propagated exception.
-* **The task is returned unchanged when `SubjectUtil.THREAD_INHERITS_SUBJECT` is `true`, or when the captured subject is `null`.** The first condition makes the change a provable no-op on JDK 17. The second is a *correctness* requirement rather than an optimization: `Subject.callAs` null-checks only its action, so binding a null subject would rebind the scoped value to null and **mask any outer binding**, actively erasing a subject that a downstream frame would otherwise have observed.
+* **Every submission is prepared, on every runtime, and an absent subject is carried across as deliberately as a present one.** The task is returned unchanged in exactly two cases: when it is `null`, so that the executor it was destined for rejects it exactly as it always has; and when it already came from `wrap`, so that a task an executor is offered a second time — as `ThreadPoolExecutor.DiscardOldestPolicy` offers it — keeps one layer, and keeps the identity of the submission that was rejected rather than picking up whichever identity happens to be current on the retry. `SubjectUtil.THREAD_INHERITS_SUBJECT` is deliberately **not** consulted here; the reasoning, the measurements and the resulting deviation from the plan of record are recorded under [Conflict 5](#Conflict_5_-_The_planned_identity_fast_paths_versus_the_measured_leak).
 
 The capture point is the substance of the fix. The idiom this change supersedes
 captured the subject inside `ThreadFactory.newThread`, which runs **once per
@@ -109,7 +111,7 @@ tests.
 * **No dependency or build-plugin version change.** See [Governing Constraints](#Governing_Constraints) and the version table under [Build and Verification Environment](#Build_and_Verification_Environment).
 * **No JVM launch-argument change.** No `--add-opens` and no `--add-exports` is added.
 * **No test is disabled, excluded, weakened or tagged flaky.** See the [Flaky-Test Exclusion Justification List](#Flaky-Test_Exclusion_Justification_List).
-* **No new configuration key.** The design self-configures from `SubjectUtil.THREAD_INHERITS_SUBJECT`.
+* **No new configuration key.** The seam reads the submitting thread's own subject, so there is no switch to configure and nothing to add to `core-default.xml`.
 * **No package move, class split, or API reshaping.** Three classes are added to an existing package; nothing is relocated.
 * **No native code change.** All C, C++, JNI and CMake sources are out of scope, which is the direct cause of one documented test failure.
 * **No cross-module edit.** `hadoop-hdfs-project`, `hadoop-yarn-project`, `hadoop-mapreduce-project` and `hadoop-tools` are untouched. A cross-module edit would have been permissible only if compilation strictly broke, and it does not.
@@ -118,10 +120,15 @@ tests.
 ### Supported runtimes
 
 This change is verified on **JDK 17 and JDK 25**, and on those two runtimes
-only. JDK 17 compatibility is guaranteed by construction rather than by
-testing: `SubjectUtil.THREAD_INHERITS_SUBJECT` is `true` there, so the wrapping
-helper returns its argument unchanged — no allocation, no indirection, and
-behaviour bit-identical to the base commit.
+only. It behaves identically on both, because the identity a task runs under is
+read from the thread that submits it rather than from anything the runtime does
+at a thread boundary. On JDK 17 that is a change in behaviour, and an intended
+one: a pooled task there used to run under the identity of whoever first caused
+its worker to exist, and it now runs under the identity of its own submitter.
+[Conflict 5](#Conflict_5_-_The_planned_identity_fast_paths_versus_the_measured_leak)
+records the measurements behind that decision, and the same assertions
+therefore hold on both runtimes rather than each runtime having assertions of
+its own.
 
 Governing Constraints
 ---------------------
@@ -176,7 +183,7 @@ thread names are likewise frozen — for example
 ### R6 in practice: the frozen configuration artifacts
 
 No configuration key was introduced, and no configuration schema or log format
-changed. The design reads `SubjectUtil.THREAD_INHERITS_SUBJECT` instead of a
+changed. The seam reads the submitting thread's own subject rather than a
 property, so there is nothing to add to `core-default.xml`. The following
 artifacts were verified byte-for-byte unchanged against the base commit; their
 exact sizes are recorded so the check is repeatable:
@@ -705,6 +712,49 @@ inheritance was conditional. Both are non-LTS and end-of-life, and the
 conservative `false` is safe: it wraps where wrapping may not be strictly
 necessary, which costs a little and breaks nothing.
 
+### Conflict 5 - The planned identity fast paths versus the measured leak
+
+The plan of record specifies two conditions under which the wrapping helper
+returns its argument unchanged: when `SubjectUtil.THREAD_INHERITS_SUBJECT` is
+`true`, described there as making the change a provable no-op on JDK 17, and
+when the captured subject is `null`, described there as preventing a null
+binding from masking an outer one. Both were implemented and both were then
+**measured to be wrong for a pooled task**, so neither is present in the
+delivered code.
+
+**Resolution: the subject is read at every submission, on every runtime, and an
+absent subject is carried across as deliberately as a present one.** The only
+cases in which a task is handed back unchanged are the two that change nothing
+at all: a `null` task, and a task already prepared by this same helper.
+
+**Justification.**
+
+* **`THREAD_INHERITS_SUBJECT` answers a different question.** It reports whether the runtime gives a *newly created* thread the identity of its creator. A pooled task does not cross that boundary: it reaches a worker that already exists. On a runtime where the flag is `true`, the identity such a worker was created with is precisely the stale one that a later submitter's task would observe, so consulting the flag hands the task to the very leak it is meant to prevent. Measured on JDK 17 with the fast path in place, on a one-worker pool: a task submitted by `bob` after a task submitted by `alice` observed **`alice`**, and a task submitted with no identity at all also observed **`alice`**. Running one user's work as another decides authorization and is what an audit record names, so this is a security defect and not a cosmetic one.
+* **The plan's own mandated guarantee cannot hold otherwise.** The requirement that a worker reused across submitters run each task under its own submitter, and the regression test that proves it, must pass on **both** runtimes. With the fast path restored, that test fails on JDK 17 — a negative control run for this page produced exactly **3** JDK 17 failures — and the only way to make it pass would be to weaken the assertions, which the rules forbid outright.
+* **A null subject must be established, not skipped.** The masking argument holds for a task that may run on the thread that prepared it; it does not hold for a task handed to a worker that outlives it. Such a worker may hold an identity of its own — one created by `SubjectInheritingThread`, or copied in by a runtime that does so — and keeps it for as long as it lives. Leaving a subjectless submission alone therefore does not leave it with nothing: it leaves it with whatever its worker was holding. Measured on JDK 17: the subjectless submission above observed `alice`. Establishing the absence gives such a task what its submitter would have observed, which is nothing.
+* **The masked-binding concern does not arise at this boundary.** Re-establishment goes through `SubjectUtil.doAs`, and every task prepared here is run by a worker at the top of its own call stack, so there is no enclosing binding on that thread for an absent identity to hide. Where an enclosing binding does exist — a task already prepared, one boundary forwarding to another — the already-prepared case returns the task untouched and nothing is established twice.
+* **A worker is not even reliably given its creator's identity.** From JDK 21 a thread pool starts its workers through the thread container that owns them rather than through `Thread.start`, so the capture that `SubjectInheritingThread` performs on start does not run for a pool worker at all. What a worker holds is therefore not knowable by the code preparing a task, which is a second, independent reason for that code to establish the submission's identity unconditionally rather than deciding when it is needed.
+
+**What this deviates from, stated plainly.** The plan's fast-path clause and its
+claim that the change costs JDK 17 nothing at all are both superseded. The cost
+on JDK 17 is now the same as on JDK 25: one small object per submission to a
+Hadoop-owned pool, and one identity established per execution, bounded by the
+number of tasks rather than by the work they do. Nothing else about JDK 17
+behaviour changes — no wire format, no log format, no configuration, no public
+signature — and the pooled-task identity that changes there changes from the
+wrong user to the right one.
+
+**Surface added beyond the plan, and why each is required by the above.** Each
+addition below was needed to make the resolution correct rather than merely
+present, and each is confined to the seam:
+
+* `wrapEach(Collection)` — the bulk submission methods (`invokeAll`, `invokeAny`) set their own deadline and decide for themselves when to hand over the next task. Preparing their tasks by reading the collection through beforehand would move work in front of the deadline and hand every task over at once, so the collection is passed on as a view that prepares each task as the method reaches it.
+* `unwrapAll(List)` — a pool stopped at once owes its caller the tasks it never started, as they were submitted. Returning the prepared forms would hand the caller objects it never passed in.
+* `ValueQueue`'s refill task prepares itself — a refill is put straight into the backing queue of the filler pool rather than submitted through it, so it never passes the point that prepares a submission. It therefore reads the identity in its own constructor, on the thread whose request made the refill necessary. What goes into the queue is still the same object, so key de-duplication, cancellation and removal by object identity are unaffected.
+* **A prepared task names the task that was submitted.** Both task wrappers delegate `toString()`. Not everything that describes a queued task gets the chance to unwrap it first: a pool that turns a submission away names the task in the exception it throws, and that message reaches an operator. This is the same obligation as the unwrap sites recorded under *R6 in practice: the unwrap obligations* above, met where unwrapping is not available to the code doing the describing.
+* **Removal, sweeping and an immediate shutdown still work on the task as submitted.** `HadoopThreadPoolExecutor` overrides `remove(Runnable)`, `purge()` and `shutdownNow()` so that a caller naming the task it submitted still finds it on the queue, a cancelled task is still swept off, and a pool stopped at once still hands back what it was given. The plan of record closes this question the other way, by recording that task-identity operations are provably unused because main source contains no `executor.remove(task)` call; that evidence is **wrong**, and the correction is worth stating because the conclusion drawn from it was that no such override is needed. `ValueQueue.drain(String)` calls `executor.remove(e)` for each queued refill it deletes — `ValueQueue.java:L317` as the base commit stands — and these are in any case public methods of a pool this project hands out to callers it does not control. Reclaiming a cancelled entry matters for a second reason as well: an entry left on a queue keeps the subject captured for it, and the credentials in it, reachable for as long as it stays there.
+* **An identity already in force is not established a second time.** A task can be prepared at more than one boundary — one executor forwarding to another, each adding decoration of its own in between, so that neither can tell by looking that the other has already been there — and every such preparation captured the same identity from the same submitting thread. All but the outermost would therefore establish an identity that is already established, which costs a scoped binding held for the whole of the task and is paid on every run. Each wrapper compares the identity it captured against the one in force, by reference, and runs its task directly when they are the same object; comparing on equality alone would leave a different instance in force from the one that was captured. `SemaphoredDelegatingExecutor` likewise leaves preparation to a delegate that already performs it, rather than adding a layer of its own.
+
 Environmental Test Failures
 ---------------------------
 
@@ -843,8 +893,9 @@ sources from `lib/src.zip` in the Temurin 25.0.4+7 installation
 (53,030,691 bytes) rather than by inference. Three files carried the load:
 `javax/security/auth/Subject.java`, whose `callAs` body is
 `ScopedValue.where(SCOPED_SUBJECT, subject).call(action::call)` and which
-null-checks only its action — the origin of both the `doAs`-not-`callAs` rule
-and the null fast path; `java/util/concurrent/AbstractExecutorService.java`,
+null-checks only its action — the origin of the `doAs`-not-`callAs` rule and of
+the reasoning about an absent subject recorded under
+[Conflict 5](#Conflict_5_-_The_planned_identity_fast_paths_versus_the_measured_leak); `java/util/concurrent/AbstractExecutorService.java`,
 which funnels all seven submission entry points through `execute(Runnable)`;
 and `java/util/concurrent/ScheduledThreadPoolExecutor.java`, which routes
 `execute` and all three `submit` overloads through `schedule`. Those last two

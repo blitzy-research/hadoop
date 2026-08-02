@@ -33,9 +33,10 @@ import java.util.concurrent.TimeUnit;
  * The four scheduling methods send their task through
  * {@link SubjectPreservingTasks} on its way in, always on the thread doing the
  * scheduling, so a task runs under the identity of whoever scheduled it rather
- * than the identity current when a worker was created. The inherited submission
- * methods cover every other way a task can be handed over to the service this
- * class wraps.
+ * than the identity current when a worker was created, and scheduling done with
+ * no identity at all runs under none rather than under whatever identity its
+ * worker was left holding. The inherited submission methods cover every other
+ * way a task can be handed over to the service this class wraps.
  * <p>
  * A repeating task re-establishes the subject of the thread that scheduled it on
  * every one of its executions, for as long as it goes on repeating: the subject

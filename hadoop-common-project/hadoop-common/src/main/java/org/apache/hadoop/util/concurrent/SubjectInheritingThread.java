@@ -44,6 +44,14 @@ import org.apache.hadoop.security.authentication.util.SubjectUtil;
  * would execute under it. Pooled tasks are therefore handled by capturing the
  * Subject at task submission instead; see {@link SubjectPreservingTasks}.
  * <p>
+ * An instance of this class used as a pool worker holds the Subject it was
+ * started with for the whole of its working life, one task after another. A
+ * pooled task therefore has to be given the identity of its own submission even
+ * when that submission carries no identity at all, or it would run as whichever
+ * submitter caused its worker to be created; that is what
+ * {@link SubjectPreservingTasks#wrap(Runnable)} is for, and it is why
+ * every executor Hadoop owns prepares tasks through it.
+ * <p>
  * When specifying a Runnable, this class is used in exactly the same way as
  * Thread.
  * <p>
