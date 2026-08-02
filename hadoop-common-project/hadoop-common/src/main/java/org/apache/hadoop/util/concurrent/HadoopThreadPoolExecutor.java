@@ -32,14 +32,21 @@ import java.util.concurrent.TimeUnit;
 
 /** An extension of ThreadPoolExecutor that provides additional functionality.
  * <p>
- * Every task handed to this pool runs under the subject current on the thread
- * that handed it over, established by
- * {@link SubjectPreservingTasks#wrap(Runnable)} in {@link #execute(Runnable)}.
- * That one method is the whole of the pool's intake, so a task is prepared
- * exactly once however it was submitted, and the code that inspects a queued
- * task rather than running it -- {@link #beforeExecute(Thread, Runnable)} here
- * and {@code ExecutorHelper} from {@link #afterExecute(Runnable, Throwable)} --
- * takes that single layer back off first.
+ * A task handed to this pool passes through
+ * {@link SubjectPreservingTasks#wrap(Runnable)} in {@link #execute(Runnable)},
+ * which is the whole of the pool's intake, so it is prepared exactly once
+ * however it was submitted. Where that utility wraps -- wherever
+ * {@code SubjectUtil.THREAD_INHERITS_SUBJECT} is {@code false}, JDK 25 among
+ * those runtimes -- the task runs under the subject current on the thread that
+ * handed it over, even on a worker another submitter brought into existence.
+ * Where the runtime propagates the subject itself, or a submission carries none
+ * at all, the task is passed on unchanged and observes whatever its worker
+ * holds: the identity in force when that worker was created, or none where the
+ * worker was given none.
+ * Either way the code that describes a queued task rather than running it --
+ * {@link #beforeExecute(Thread, Runnable)} here and {@code ExecutorHelper} from
+ * {@link #afterExecute(Runnable, Throwable)} -- takes that single layer back off
+ * first.
  *  */
 public final class HadoopThreadPoolExecutor extends ThreadPoolExecutor {
 
@@ -86,8 +93,7 @@ public final class HadoopThreadPoolExecutor extends ThreadPoolExecutor {
   }
 
   /**
-   * Hands a task to the pool so that it runs under the subject current on the
-   * submitting thread.
+   * Hands a task to the pool, prepared on the terms the class contract states.
    * <p>
    * This is the only place a task entering this pool is prepared, and it covers
    * every way of entering it: {@code AbstractExecutorService} routes all three

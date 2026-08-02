@@ -26,43 +26,34 @@ import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 
 /**
- * A scheduled executor service that carries the scheduling thread's JAAS
- * subject into every task it passes to the scheduled executor service it
- * wraps.
+ * A scheduled executor service that prepares the tasks it forwards so that they
+ * carry the scheduling thread's JAAS subject.
  * <p>
  * The four scheduling methods send their task through
  * {@link SubjectPreservingTasks} on its way in, always on the thread doing the
- * scheduling, so a task runs under the identity of whoever scheduled it rather
- * than the identity current when a worker was created. Where that utility has
- * nothing to establish -- on a runtime that hands a new thread its creator's
- * subject, or for scheduling done with no subject at all -- the task is passed
- * on exactly as it arrived. The inherited submission methods cover every other
- * way a task can be handed over to the service this class wraps.
- * <p>
- * A repeating task re-establishes the subject of the thread that scheduled it on
- * every one of its executions, for as long as it goes on repeating: the subject
- * is read once, when the schedule is created, so however much later a repetition
- * falls it runs under the identity the schedule was created under. Long-lived
- * work whose purpose is to maintain a caller's credentials depends on that.
+ * scheduling, and the inherited submission methods cover every other way a task
+ * can reach the service this class wraps. Where that utility wraps -- wherever
+ * {@code SubjectUtil.THREAD_INHERITS_SUBJECT} is {@code false}, JDK 25 among
+ * those runtimes -- a task runs under the identity of whoever scheduled it
+ * rather than the identity current when a worker was created, and a repeating
+ * task under that same identity on every one of its executions rather than on
+ * the first alone, because the subject is read once when the schedule is created
+ * and re-established on each run. Long-lived work whose purpose is to maintain a
+ * caller's credentials depends on that. Where the runtime propagates the subject
+ * itself, or scheduling carries none at all, the task is forwarded as it arrived
+ * and observes whatever its worker holds.
  * <p>
  * Nothing else is altered. A delay, a period and a unit are passed on as given,
- * so the wrapped service keeps sole charge of its timing and still refuses an
- * argument it would have refused before, and the {@link ScheduledFuture} handed
- * back is the one it returned rather than a stand-in, so cancelling a task,
- * waiting on its result and reading its remaining delay all behave as they did.
+ * so the wrapped service keeps sole charge of its timing, and the
+ * {@link ScheduledFuture} handed back is the one it returned rather than a
+ * stand-in, so cancelling a task, waiting on its result and reading its
+ * remaining delay all reach that service directly.
  * <p>
- * It forwards rather than extends because {@link HadoopThreadPoolExecutor} is
- * final and the single-thread scheduled services {@link HadoopExecutors} obtains
- * from {@link java.util.concurrent.Executors} are implementations Hadoop cannot
- * see into, with particular semantics it has deliberately not reproduced.
- * <p>
- * Such a service is the only thing this class is for. A pool Hadoop owns, such
- * as {@link HadoopScheduledThreadPoolExecutor}, already carries the identity
- * into the tasks handed to it, and putting this in front of one would not merely
- * be redundant: a task prepared here and then submitted rather than scheduled
- * reaches that pool inside a new future the pool builds around it, which the
- * pool prepares in turn, leaving the task behind two layers where
- * {@link SubjectPreservingTasks#unwrap(Runnable)} takes one back off.
+ * Why it forwards rather than extends, and why it belongs in front of a
+ * scheduled service {@link HadoopExecutors} obtains from
+ * {@link java.util.concurrent.Executors} and not in front of a pool Hadoop owns
+ * such as {@link HadoopScheduledThreadPoolExecutor}, is set out on
+ * {@link SubjectPreservingExecutorService}.
  */
 @InterfaceAudience.Private
 public class SubjectPreservingScheduledExecutorService
@@ -83,16 +74,6 @@ public class SubjectPreservingScheduledExecutorService
     this.scheduledDelegate = delegate;
   }
 
-  /**
-   * Schedules a task to be run once, after the given delay, under the subject
-   * current on this thread.
-   *
-   * @param command the task to run
-   * @param delay how long to wait before running the task
-   * @param unit the unit {@code delay} is given in
-   * @return a future representing the pending completion of the task, and from
-   *         which the delay still to run can be read
-   */
   @Override
   public ScheduledFuture<?> schedule(Runnable command, long delay,
       TimeUnit unit) {
@@ -100,17 +81,6 @@ public class SubjectPreservingScheduledExecutorService
         delay, unit);
   }
 
-  /**
-   * Schedules a task to be called once, after the given delay, under the
-   * subject current on this thread.
-   *
-   * @param <V> the result type of the task
-   * @param callable the task to call
-   * @param delay how long to wait before calling the task
-   * @param unit the unit {@code delay} is given in
-   * @return a future representing the pending result of the task, and from
-   *         which the delay still to run can be read
-   */
   @Override
   public <V> ScheduledFuture<V> schedule(Callable<V> callable, long delay,
       TimeUnit unit) {
@@ -119,17 +89,16 @@ public class SubjectPreservingScheduledExecutorService
   }
 
   /**
-   * Schedules a task to be run over and over at the given rate, under the
-   * subject current on this thread, beginning after the given initial delay.
-   * <p>
-   * Every execution runs under that subject, and not the first alone.
+   * Schedules a task to be run over and over at the given rate, beginning after
+   * the given initial delay, prepared on the terms the class contract states.
    *
    * @param command the task to run
    * @param initialDelay how long to wait before the first execution
    * @param period how long to leave between the starts of two executions
    * @param unit the unit {@code initialDelay} and {@code period} are given in
    * @return a future representing the series of executions still to come, which
-   *         ends only once it is cancelled or an execution fails
+   *         ends only when it is cancelled, when the wrapped service terminates
+   *         and cancels it in turn, or when an execution throws
    */
   @Override
   public ScheduledFuture<?> scheduleAtFixedRate(Runnable command,
@@ -140,10 +109,8 @@ public class SubjectPreservingScheduledExecutorService
 
   /**
    * Schedules a task to be run over and over with the given delay between one
-   * execution and the next, under the subject current on this thread, beginning
-   * after the given initial delay.
-   * <p>
-   * Every execution runs under that subject, and not the first alone.
+   * execution and the next, beginning after the given initial delay, prepared on
+   * the terms the class contract states.
    *
    * @param command the task to run
    * @param initialDelay how long to wait before the first execution
@@ -151,7 +118,8 @@ public class SubjectPreservingScheduledExecutorService
    *        start of the next
    * @param unit the unit {@code initialDelay} and {@code delay} are given in
    * @return a future representing the series of executions still to come, which
-   *         ends only once it is cancelled or an execution fails
+   *         ends only when it is cancelled, when the wrapped service terminates
+   *         and cancels it in turn, or when an execution throws
    */
   @Override
   public ScheduledFuture<?> scheduleWithFixedDelay(Runnable command,

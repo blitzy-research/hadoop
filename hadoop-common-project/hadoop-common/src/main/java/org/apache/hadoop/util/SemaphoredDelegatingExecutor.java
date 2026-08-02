@@ -49,6 +49,15 @@ import static org.apache.hadoop.fs.statistics.StoreStatisticNames.ACTION_EXECUTO
  * contains the thread pool logic, whereas this isolates the semaphore
  * and submit logic for use with other thread pools and delegation models.
  * <p>
+ * Because the pool this delegates to is supplied by the caller and may be any
+ * executor at all, a task is prepared here, on the submitting thread, by
+ * {@link SubjectPreservingTasks#wrap(Runnable)} rather than left to that pool to
+ * prepare. The preparation goes on the inside of the permit-releasing decorator
+ * and not around it, so the submitting thread's JAAS subject is established for
+ * the task's own execution alone: releasing the permit, which the outer
+ * decorator does in a {@code finally}, happens outside that identity, and
+ * happens whether the task returned or threw.
+ * <p>
  * This is inspired by <a href="https://github.com/apache/incubator-s4/blob/master/subprojects/s4-comm/src/main/java/org/apache/s4/comm/staging/BlockingThreadPoolExecutorService.java">
  * this s4 threadpool</a>
  */

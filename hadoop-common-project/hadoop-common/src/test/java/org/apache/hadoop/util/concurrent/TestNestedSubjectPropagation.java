@@ -41,54 +41,45 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
 /**
- * Asserts that identities nest correctly when a scope that establishes one
- * hands work to an executor and the task then establishes another.
+ * Asserts that identities nest correctly when a scope that establishes one hands
+ * work to an executor and the task then establishes another.
  * <p>
  * Running work as a user means establishing that user for as long as the work
- * lasts, and such a scope may be entered again from within itself, either on
- * the same thread or on a pool worker the outer scope handed the work to. Each
- * of these tests therefore reads the identity in force at every level of a
- * nested arrangement: on the thread that established the outer one, inside the
- * task the pool ran for it, inside the scope the task established for itself,
- * and again once that scope has been left. An identity that failed to reach the
- * task would leave the work running as whoever the process logged in as, and
- * one that outlived the scope that established it would leave a later caller
- * running as a user it never asked for; either decides authorization and is
- * what an audit record names.
+ * lasts, and such a scope may be entered again from within itself, either on the
+ * same thread or on a pool worker the outer scope handed the work to. Each test
+ * therefore reads the identity in force at every level: on the thread that
+ * established the outer one, inside the task the pool ran for it, inside the
+ * scope the task established for itself, and again once that scope has been left.
+ * An identity that failed to reach the task would leave the work running as
+ * whoever the process logged in as, and one that outlived the scope that
+ * established it would leave a later caller running as a user it never asked
+ * for; either decides an authorization and is what an audit record names.
  * <p>
- * Every assertion here is about an identity that was observed rather than about
- * how it was carried, so the same assertions hold on every runtime this project
- * supports: where the runtime hands a new thread the identity of its creator
- * and where it hands over nothing, a task observes the identity that submitted
- * it either way. Each pooled hop uses an executor created for it whose first
- * submission is made from inside the scope under test, so the worker that runs
- * the task belongs to that scope; identities are built with names of their own
- * so that a silent fall back to the process login can never be mistaken for
- * success; and every observation crosses a thread boundary through a future or
- * an atomic reference. Identities are compared as identities rather than by
- * name as well, because a user is told apart by the identity behind it.
+ * Every assertion is about an identity observed rather than about how it was
+ * carried, and holds whether the runtime hands a new thread the identity of its
+ * creator, as Java 21 and earlier do, or hands over nothing, as Java 24 and later
+ * do: each pooled hop uses an executor created for it whose first submission is
+ * made from inside the scope under test, so the worker that runs the task belongs
+ * to that scope and observes its identity either way. Identities are built with
+ * names of their own so that a silent fall back to the process login cannot be
+ * mistaken for success, are compared as identities rather than by name, and every
+ * observation crosses a thread boundary through a future or an atomic reference.
  */
 public class TestNestedSubjectPropagation {
 
-  /** Identity the outermost scope of each test establishes. */
   private static final String OUTER_USER = "nested-outer-user";
 
-  /** Identity the scope nested inside the outer one establishes. */
   private static final String INNER_USER = "nested-inner-user";
 
-  /** Identity the innermost of three nested scopes establishes. */
   private static final String DEEPEST_USER = "nested-deepest-user";
 
   /** Bound on every wait, generous enough to survive a loaded build host. */
   private static final long TIMEOUT_SECONDS = 10;
 
-  /** Every executor a test created, shut down when that test ends. */
   private final List<ExecutorService> pools = new ArrayList<>();
 
-  /** The configuration the identity machinery is set up with. */
   private Configuration conf;
 
-  /** Puts the identity machinery into a known state before each test. */
   @BeforeEach
   public void setupUgi() {
     conf = new Configuration();
@@ -102,11 +93,6 @@ public class TestNestedSubjectPropagation {
     UserGroupInformation.setLoginUser(null);
   }
 
-  /**
-   * Shuts down every executor a test created and waits for each to finish.
-   *
-   * @throws InterruptedException if this thread is interrupted while waiting
-   */
   @AfterEach
   public void shutDownPools() throws InterruptedException {
     List<ExecutorService> registered = new ArrayList<>(pools);
@@ -120,13 +106,6 @@ public class TestNestedSubjectPropagation {
     }
   }
 
-  /**
-   * Records an executor so that it is shut down when the test ends.
-   *
-   * @param <E> the executor's own type, so that a caller keeps it
-   * @param pool the executor to shut down later
-   * @return {@code pool}
-   */
   private <E extends ExecutorService> E register(E pool) {
     pools.add(pool);
     return pool;
@@ -135,14 +114,10 @@ public class TestNestedSubjectPropagation {
   /**
    * Waits for a submitted task and yields what it returned.
    * <p>
-   * A failure inside a pooled task arrives here wrapped. An assertion that
-   * failed there has to reach the test runner as it was, so it is rethrown
-   * unchanged; anything else is reported as the failure of a task rather than
-   * of the wait, and a wait that runs out is reported as such.
-   *
-   * @param <T> the type the task yields
-   * @param submitted the task to wait for
-   * @return what the task returned
+   * A failure inside a pooled task arrives here wrapped. An assertion that failed
+   * there has to reach the test runner as it was, so it is rethrown unchanged;
+   * anything else is reported as the failure of a task rather than of the wait,
+   * and a wait that runs out is reported as such.
    */
   private static <T> T awaitQuietly(Future<T> submitted) {
     try {
@@ -168,25 +143,20 @@ public class TestNestedSubjectPropagation {
    * establishes for itself wins for as long as it lasts, and the submitter's
    * identity is exactly restored once that scope has been left.
    * <p>
-   * The four readings this takes are the whole of what nesting has to mean. The
-   * first is taken on the thread that established the outer identity, so that a
-   * failure there is told apart from one that only shows up across a thread
-   * boundary. The second is taken inside the task the pool ran, which is where
-   * an identity that never travelled would show up as the process login. The
-   * third is taken inside the scope the task established for itself, and the
-   * fourth after leaving it, which is where an identity established without
-   * being taken back down again would show up. Each reading is asserted both as
-   * an identity and by the name of its user, so that neither a second identity
-   * carrying the same name nor the same identity renamed could satisfy it.
+   * Four readings are what nesting has to mean: on the thread that established
+   * the outer identity, so that a failure there is told apart from one that only
+   * shows up across a thread boundary; inside the task the pool ran, which is
+   * where an identity that never travelled would show up as the process login;
+   * inside the scope the task established for itself; and after leaving it, which
+   * is where an identity established without being taken back down again would
+   * show up. Each is asserted both as an identity and by the name of its user, so
+   * that neither a second identity of the same name nor the same identity renamed
+   * could satisfy it.
    * <p>
-   * A fifth reading is taken on this thread before the outer scope is entered
-   * and asserted again once it has been left. Asserting merely that the outer
-   * identity is gone would be satisfied by any other identity taking its place,
-   * the inner one included, so the identity that was in force beforehand is
-   * captured and required back exactly: an identity that leaked out of a scope
-   * is what would leave a later caller running as a user it never asked for.
-   *
-   * @throws Exception if a task fails or a wait times out
+   * A fifth reading is taken on this thread before the outer scope is entered and
+   * required back exactly once it has been left. Asserting merely that the outer
+   * identity is gone would be satisfied by any other taking its place, the inner
+   * one included.
    */
   @Test
   @Timeout(value = 30)
@@ -261,15 +231,10 @@ public class TestNestedSubjectPropagation {
    * afterwards, on a single thread.
    * <p>
    * This is the case with no executor in it at all, so a failure here says that
-   * nesting itself is wrong rather than that an identity failed to cross a
-   * thread boundary, which is what tells the two apart.
-   * <p>
-   * The identity in force before the outermost scope is entered is captured and
-   * required back exactly once it has been left, so that an identity outliving
-   * the scope that established it is caught here too rather than only where a
-   * pool is involved.
-   *
-   * @throws Exception if an identity cannot be read
+   * nesting itself is wrong rather than that an identity failed to cross a thread
+   * boundary. The identity in force beforehand is required back exactly, so an
+   * identity outliving its scope is caught here too and not only where a pool is
+   * involved.
    */
   @Test
   @Timeout(value = 30)
@@ -316,13 +281,10 @@ public class TestNestedSubjectPropagation {
    * A task submitted from inside the inner scope runs under the inner identity,
    * not under the one that scope was entered from.
    * <p>
-   * This is the nesting of the first case in the other order. The identity in
-   * force at the moment of submission is the innermost one, so an
-   * implementation that read an identity anywhere other than at the submission
-   * would hand the task the outer one instead. The executor is created inside
-   * the inner scope, so the worker that runs the task belongs to it.
-   *
-   * @throws Exception if a task fails or a wait times out
+   * This is the first case nested in the other order. The identity in force at
+   * the moment of submission is the innermost one, so an implementation reading
+   * an identity anywhere other than at the submission would hand the task the
+   * outer one instead.
    */
   @Test
   @Timeout(value = 30)
@@ -368,14 +330,9 @@ public class TestNestedSubjectPropagation {
   }
 
   /**
-   * Three scopes nested on a pool worker each win in turn and are each taken
-   * back down in the order they were established.
-   * <p>
-   * Two levels show that an identity can be established over another; three
-   * show that what is given back on the way out is the level immediately
-   * outside rather than the outermost one, which two levels cannot tell apart.
-   *
-   * @throws Exception if a task fails or a wait times out
+   * Two levels show that an identity can be established over another; three show
+   * that what is given back on the way out is the level immediately outside
+   * rather than the outermost one, which two levels cannot tell apart.
    */
   @Test
   @Timeout(value = 30)
@@ -446,14 +403,9 @@ public class TestNestedSubjectPropagation {
   }
 
   /**
-   * A pooled task that establishes an identity of its own still reports the
-   * submitter's once it is done, through the future the submission yielded.
-   * <p>
    * The names travel back as the value of the task rather than through a field
-   * this test set aside, so what a caller reading the result of the work sees is
-   * what is asserted.
-   *
-   * @throws Exception if a task fails or a wait times out
+   * this test set aside, so what is asserted is what a caller reading the result
+   * of the work sees.
    */
   @Test
   @Timeout(value = 30)

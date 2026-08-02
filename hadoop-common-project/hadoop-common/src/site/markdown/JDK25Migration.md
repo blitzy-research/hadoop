@@ -51,7 +51,7 @@ This change is therefore **not** a compilation fix, and it should not be read
 as one. It does two things:
 
 * **(a) It purges SecurityManager-era API usage.** JEP 486 permanently disabled the Security Manager in JDK 24, and JDK 25 inherits that state. The API that remains is deprecated for removal and already semantically inert, so the usage is removed by inlining rather than by reimplementation.
-* **(b) It closes a silent `javax.security.auth.Subject` propagation hole.** On JDK 18 and later, `Subject.callAs` establishes the current subject as a `ScopedValue` binding. That binding is confined to the dynamic extent of the call on the binding thread and is not seen by a pool worker thread. Code that previously ran as an authenticated user now runs with no subject at all — and it compiles cleanly, throws nothing, and logs nothing.
+* **(b) It closes a silent `javax.security.auth.Subject` propagation hole.** `Subject.callAs`, the replacement for the terminally deprecated `Subject.doAs`, establishes the current subject in a way a pool worker thread does not see. On the runtime this change is verified against, Temurin **25.0.4+7**, it does so with a `ScopedValue` binding — read from that release's own `java.base` sources, not inferred — and such a binding is confined to the dynamic extent of the call on the binding thread. Whatever mechanism any other release uses, the measured JDK 25 outcome is what matters here: code that previously ran as an authenticated user now runs with no subject at all — and it compiles cleanly, throws nothing, and logs nothing.
 
 Defect (b) is the reason this work matters. No compiler diagnoses it and no
 pre-existing test detects it. It surfaces later as an authorization denial, an
@@ -120,11 +120,11 @@ are main source, 3 are the new tests, 1 is this page and 1 is `BUILDING.txt`.
 Coverage that would have required a fourteenth test file, or a fifteenth, is
 recorded instead as a deliberate deferral under
 [Other deliberate deferrals under R1](#Other_deliberate_deferrals_under_R1),
-because adding it would have taken the change past the boundary set for it.
+because adding it would have taken the change past the 39 paths above.
 
 ### Explicit non-goals
 
-* **No behaviour change of any kind.** No RPC wire format, token serialization layout, delegation-token semantic, Kerberos or JAAS authentication outcome, log output format, configuration schema, or public signature in `org.apache.hadoop.security.*` changes.
+* **No behaviour change outside the identity a pooled task runs under.** No RPC wire format, token serialization layout, delegation-token semantic, Kerberos or JAAS authentication outcome, log output format, configuration schema, or public signature in `org.apache.hadoop.security.*` changes. What does change is the one thing this work exists to change, and only on a runtime that no longer carries a subject across a thread boundary: on JDK 25, a task submitted into a Hadoop-owned pool now runs under its own submitter's identity instead of under none, so work that would have been authorized and audited with no subject at all is authorized and audited as the user that asked for it. That correction is the purpose of the change, and entry (v) of the [Behavioural Resolution Register](#Behavioural_Resolution_Register) states what each runtime does.
 * **No dependency or build-plugin version change.** See [Governing Constraints](#Governing_Constraints) and the version table under [Build and Verification Environment](#Build_and_Verification_Environment).
 * **No JVM launch-argument change.** No `--add-opens` and no `--add-exports` is added.
 * **No test is disabled, excluded, weakened or tagged flaky.** See the [Flaky-Test Exclusion Justification List](#Flaky-Test_Exclusion_Justification_List).
@@ -163,14 +163,12 @@ Governing Constraints
 
 ### Provenance of these constraints
 
-`review_rules` reports **`No user rules provided.`** — including on a
-complete-document read. **There is no separate on-disk user rules document for
-this project.** The seven binding constraints recorded below are embedded in the
-requirements for this work, which is the authoritative source of record for
-their exact wording; they are summarized here rather than transcribed. The
-absence of a rules file is not treated as licence to lower the bar: standard
-Apache Hadoop documentation and engineering practice applies on top of these
-seven.
+**There is no separate rules document in this repository.** The seven binding
+constraints recorded below were set out with the requirements for this
+migration; they are summarized here, rather than transcribed, so that a reader
+of the change can see what governed it without leaving the tree. Their not being
+under version control is no licence to lower the bar: standard Apache Hadoop
+documentation and engineering practice applies on top of these seven.
 
 ### What each constraint requires
 
@@ -180,7 +178,7 @@ seven.
 * **R4 — No new dependency for security-context handling**; only the JDK and existing Hadoop utilities. Zero dependencies were added, removed or re-versioned.
 * **R5 — No disabling or excluding failing tests**, except tests documented as flaky at baseline, each with a written justification. The baseline flaky set is provably empty, so no exclusion was permissible and none was made.
 * **R6 — Logging output formats and configuration file schemas must not change.** This is the constraint with the largest design consequence: it is what turned a plausible implementation into a correct one, by forcing the unwrap obligations described below.
-* **R7 — Where correct behaviour is ambiguous, pre-JDK-18 behaviour at the base commit is the tie-breaker, and each resolution must be documented.** **R7 is the sole reason this document exists**, and its register is the [Behavioural Resolution Register](#Behavioural_Resolution_Register).
+* **R7 — Where correct behaviour is ambiguous, pre-JDK-18 behaviour at the base commit is the tie-breaker, and each resolution must be documented.** Its documentation clause is why this page exists at all, and its register is the [Behavioural Resolution Register](#Behavioural_Resolution_Register) — though the page is not that register alone: it also carries the [Static Audit of SecurityManager-Era API](#Static_Audit_of_SecurityManager-Era_API) required of this change, the [Flaky-Test Exclusion Justification List](#Flaky-Test_Exclusion_Justification_List) required by R5, and the [Documented Conflict Resolutions](#Documented_Conflict_Resolutions).
 
 ### R3 in practice - no new reflection
 
@@ -239,7 +237,7 @@ and are not reached through published state on the runtimes this project builds
 with, so removing the privileged block around them leaves them without direct
 coverage. Reaching them would take either reflection, which R3's spirit and this
 section's own claim both argue against, or a widened production surface, which
-R1 forbids, or test files beyond the boundary set for this change. That is
+R1 forbids, or test files beyond the 39 this change touches. That is
 recorded as a deliberate deferral rather than dressed up as coverage — see
 **Coverage of inlined private bodies** under
 [Other deliberate deferrals under R1](#Other_deliberate_deferrals_under_R1).
@@ -256,10 +254,10 @@ code rather than by reasoning from the API:
 * **`ExecutorHelper` fidelity site 2** — the JDK-8071638 guard `if (t == null && r instanceof Future<?> && ((Future<?>) r).isDone())` at `ExecutorHelper.java:L46` at the base commit, preceded by its `// Handle JDK-8071638` comment. A decorator is a `Runnable`, not a `Future`, so this condition would have evaluated `false` for every pooled task, the `((Future<?>) r).get()` that follows would never have run, and the `LOG.warn("Caught exception in thread {}  + : ", …)` further down — whose doubled space is preserved verbatim — would have **silently stopped reporting task exceptions**. That is a regression with no compiler signal and no failing test.
 * **Both `beforeExecute` overrides** — `HadoopThreadPoolExecutor.java:L82-83` and `HadoopScheduledThreadPoolExecutor.java:L61-62` at the base commit, byte-identical text logging `r.getClass().getName()`.
 
-Two points are worth recording precisely, because they were missed in earlier
-analysis and rediscovering them is expensive:
+Two points are worth recording precisely, because both are easy to overlook and
+expensive to rediscover:
 
-* **`ExecutorHelper` has two fidelity sites, not one.** Earlier analysis identified only the `instanceof Future<?>` guard. A single reassignment placed at the top of `logThrowableFromAfterExecute` covers both sites at once, which is how the fix is implemented; in the post-change file that reassignment is `r = SubjectPreservingTasks.unwrap(r);` at `ExecutorHelper.java:L36`, and it shifts the two sites to `:L38` and `:L47` respectively.
+* **`ExecutorHelper` has two fidelity sites, not one.** The `instanceof Future<?>` guard is the conspicuous one; the debug line that names the task's type is the other, and a fix that addressed only the guard would still have altered operator-visible output. A single reassignment at the top of `logThrowableFromAfterExecute` covers both at once, which is how it is implemented: `r = SubjectPreservingTasks.unwrap(r);` at `ExecutorHelper.java:L36`, with the two sites at `:L38` and `:L47`.
 * **R6 is the *only* reason `ExecutorHelper.java` is in scope at all.** Nothing in the functional requirements would have identified it as needing a change.
 
 One further R6 consequence: `HadoopExecutors.shutdown(...)` logs the executor
@@ -395,8 +393,9 @@ The remaining nine files were driven to zero by this change:
 | `hadoop-auth/.../org/apache/hadoop/util/PlatformName.java` | 1 | L92 `return AccessController.doPrivileged((PrivilegedAction<Boolean>) () -> {`, in `isSystemClassAvailable` |
 
 Note that `PlatformName` sits in package `org.apache.hadoop.util`, not in
-`org.apache.hadoop.security.authentication.util`; an earlier inventory omitted
-it and consequently listed only nine of the ten files.
+`org.apache.hadoop.security.authentication.util` where the rest of `hadoop-auth`
+keeps its utilities. A search that assumes the latter finds nine of these ten
+files; the count above is ten.
 
 ### Post-change state, and the single exemption
 
@@ -541,8 +540,8 @@ failure.
 Count these two type names on a word boundary. A plain substring search for
 `PrivilegedAction` returns 26 in the same tree, because it also matches the 6
 occurrences of `PrivilegedActionException` and the 3 of the private helper
-`tracePrivilegedAction`; neither is one of the two action types, and an earlier
-revision of this page reported that 26 as though it were.
+`tracePrivilegedAction`; neither is one of the two action types, so that 26
+overstates `PrivilegedAction` by nine.
 
 Flaky-Test Exclusion Justification List
 ---------------------------------------
@@ -670,11 +669,11 @@ carried none either, so leaving them non-propagating preserves the behaviour
 the tie-breaker protects, while wrapping them would add per-task cost for no
 semantic gain. Recorded as an accepted residual risk.
 
-For the avoidance of doubt about where these sites live: the
-`hadoop-common-project/hadoop-nfs` tree contains no `Executors.new*` and no
-`EventLoopGroup` construction at all — it holds only `mount/` and `nfs/`
-packages. Earlier analysis attributed these four sites to `hadoop-nfs`; they
-are in `hadoop-common`, at the line numbers above.
+For the avoidance of doubt about where these sites live: they are in
+`hadoop-common`, at the line numbers above, and not in the NFS module their
+subject matter suggests. The `hadoop-common-project/hadoop-nfs` tree contains no
+`Executors.new*` and no `EventLoopGroup` construction at all — it holds only
+`mount/` and `nfs/` packages.
 
 ### (ii) `RolloverSignerSecretProvider` cannot reach the centralized utility
 
@@ -927,12 +926,12 @@ the deadline itself rather than assume this class is transparent to it.
 
 ### Other deliberate deferrals under R1
 
-Recorded for the same reason: so that a later reader can tell a decision from
-an omission. None of the following was changed.
+None of the following was changed, and each is a decision with a reason rather
+than an oversight.
 
-* **Per-call-site coverage of the fourteen redirections.** What each redirection changes is which class constructs a pool, and every one of those classes is covered directly: the nine factories of `HadoopExecutors`, both pool classes, both forwarding services and both decorating executors in `org.apache.hadoop.util` are each submitted to and asserted on by `TestExecutorSubjectPropagation`, and removing the fix from `SubjectPreservingTasks` fails 44 of its tests. What is not covered is a per-site assertion that a given call site's own pool propagates — that a task submitted to, say, the delay executor inside `ha/ZKFailoverController.java` observes its submitter. Every one of those pools is a private field of a class whose test file lies outside the set of files this change is bounded to, and reaching one from outside would take reflection, which [R3 in practice - no new reflection](#R3_in_practice_-_no_new_reflection) rules out. Each redirection is therefore established statically instead: what it consists of is a single identifier, so it is settled by reading the diff for that one line, and six of the fourteen are pinned down further by the deleted import each one causes, enumerated under [Companion check: the plain import form](#Companion_check:_the_plain_import_form). That is a property of the change rather than of a run, and it is the kind of property a reader checks rather than executes.
-* **Coverage of inlined private bodies.** Of the seven inlined privileged actions, five end up exercised through published state and two do not. `CleanerUtil`'s two bodies decide the public `UNMAP_SUPPORTED` and `UNMAP_NOT_SUPPORTED_REASON` and are reached again whenever `getCleaner().freeBuffer(...)` runs; `FastByteComparisons`' body decides which comparer `compareTo` uses; and both `DynMethods.Builder.hiddenImpl` and the matching `DynConstructors` builder are public. The two without coverage are `PlatformName.isSystemClassAvailable` at `:L89`, which is private and reached only from `hasIbmTechnologyEditionModules()` at `:L72` — itself short-circuited by `JAVA_VENDOR_NAME.contains("IBM")` at `:L65`, so on the Temurin runtimes this project builds with it is never called at all — and the `pluginLoader = new URLClassLoader(urls, defaultLoader);` branch of the package-private `MetricsConfig.getPluginLoader()` at `:L247`, which needs a `plugin.urls` entry that the existing suite supplies nowhere: the only two in-tree references are **commented out**, at `TestMetricsSystemImpl.java:112` and `:154`. Closing either gap would take reflection, which [R3 in practice - no new reflection](#R3_in_practice_-_no_new_reflection) rules out; or a widened production surface, which R1 forbids; or test files outside the boundary set for this change. Both are therefore deferred rather than dressed up as coverage. What makes the deferral safe is that neither body's *semantics* changed: per JEP 486 a JDK 24+ runtime already executed these actions immediately, so inlining them reproduces exactly what the JVM was doing — see [Why the removals are provable no-ops](#Why_the_removals_are_provable_no-ops).
-* **A navigation entry for this page.** `hadoop-project/src/site/site.xml` carries the site's menu — `Compatibility.md` is reached from it through `<item name="Compatibility Specification" href="hadoop-project-dist/hadoop-common/Compatibility.html"/>` at `:L50` — and this page is deliberately **not** added to it. Doxia renders every `src/site/markdown/*.md` into the corresponding `.html` whether or not it is listed, so the page is published either way; `site.xml` governs only the menu. Adding the entry would take the change set past the boundary set for it, which lists exactly two documentation paths, and the boundary is the stricter obligation. Recorded so the omission reads as a decision.
+* **Per-call-site coverage of the fourteen redirections.** What each redirection changes is which class constructs a pool, and every one of those classes is covered directly: the nine factories of `HadoopExecutors`, both pool classes, both forwarding services and both decorating executors in `org.apache.hadoop.util` are each submitted to and asserted on by `TestExecutorSubjectPropagation`, and removing the fix from `SubjectPreservingTasks` fails 44 of its tests. What is not covered is a per-site assertion that a given call site's own pool propagates — that a task submitted to, say, the delay executor inside `ha/ZKFailoverController.java` observes its submitter. Every one of those pools is a private field of a class whose test file lies outside the 39 paths this change touches, and reaching one from outside would take reflection, which [R3 in practice - no new reflection](#R3_in_practice_-_no_new_reflection) rules out. Each redirection is therefore established statically instead: what it consists of is a single identifier, so it is settled by reading the diff for that one line, and six of the fourteen are pinned down further by the deleted import each one causes, enumerated under [Companion check: the plain import form](#Companion_check:_the_plain_import_form). That is a property of the change rather than of a run, and it is the kind of property a reader checks rather than executes.
+* **Coverage of inlined private bodies.** Of the seven inlined privileged actions, five end up exercised through published state and two do not. `CleanerUtil`'s two bodies decide the public `UNMAP_SUPPORTED` and `UNMAP_NOT_SUPPORTED_REASON` and are reached again whenever `getCleaner().freeBuffer(...)` runs; `FastByteComparisons`' body decides which comparer `compareTo` uses; and both `DynMethods.Builder.hiddenImpl` and the matching `DynConstructors` builder are public. The two without coverage are `PlatformName.isSystemClassAvailable` at `:L89`, which is private and reached only from `hasIbmTechnologyEditionModules()` at `:L72` — itself short-circuited by `JAVA_VENDOR_NAME.contains("IBM")` at `:L65`, so on the Temurin runtimes this project builds with it is never called at all — and the `pluginLoader = new URLClassLoader(urls, defaultLoader);` branch of the package-private `MetricsConfig.getPluginLoader()` at `:L247`, which needs a `plugin.urls` entry that the existing suite supplies nowhere: the only two in-tree references are **commented out**, at `TestMetricsSystemImpl.java:112` and `:154`. Closing either gap would take reflection, which [R3 in practice - no new reflection](#R3_in_practice_-_no_new_reflection) rules out; or a widened production surface, which R1 forbids; or test files beyond the 39 this change touches. Both are therefore deferred rather than dressed up as coverage. What makes the deferral safe is that neither body's *semantics* changed: per JEP 486 a JDK 24+ runtime already executed these actions immediately, so inlining them reproduces exactly what the JVM was doing — see [Why the removals are provable no-ops](#Why_the_removals_are_provable_no-ops).
+* **A navigation entry for this page.** `hadoop-project/src/site/site.xml` carries the site's menu — `Compatibility.md` is reached from it through `<item name="Compatibility Specification" href="hadoop-project-dist/hadoop-common/Compatibility.html"/>` at `:L50` — and this page is deliberately **not** added to it. Doxia renders every `src/site/markdown/*.md` into the corresponding `.html` whether or not it is listed, so the page is published either way; `site.xml` governs only the menu. This change is limited to two documentation paths, this page and `BUILDING.txt`, so the menu entry is left to whoever next edits `site.xml`.
 * **The `require.test.libhadoop` build-configuration defect** — fully root-caused under [Environmental Test Failures](#Environmental_Test_Failures) and deliberately not fixed.
 * **Three call sites that already route correctly** — `util/ShutdownHookManager.java:L80`, `hadoop-registry/.../RegistryAdminService.java:L113` and the cached-pool site in `hadoop-registry/.../RegistryDNS.java` (base-commit `:L172`, now `:L171`) already call `HadoopExecutors`, so the centralized fix reaches them automatically and none received a hunk. Editing them would be a change with no defect behind it. The first two files are untouched entirely; `RegistryDNS` was edited only at its *other* pool site, a raw `Executors.newSingleThreadExecutor()` at base-commit `:L1177`, which is why the cached-pool line above shifted by one.
 * **The superseded capture idiom in `UserGroupInformation`** (base-commit `:L934-936`, where the TGT-renewer pool's `ThreadFactory` returns a `SubjectInheritingThread`) is left in place; removing it is cleanup, not migration. It is genuinely superseded rather than merely redundant: on JDK 25 that thread's `start()` override never runs, because a pool starts its workers through their thread container instead, so the idiom propagates nothing there and the submission-time capture is what makes the renewer's task run as the right user; on JDK 17 the runtime propagates the identity itself and both are no-ops. The measurement is entry (v) of the [Behavioural Resolution Register](#Behavioural_Resolution_Register).
@@ -953,12 +952,11 @@ of a trailing newline in `HadoopExecutors.java` is legitimate and was not
 Documented Conflict Resolutions
 -------------------------------
 
-**Five** conflicts are resolved here, each with its justification. Four of them
-arose between the technical specifications, the seven constraints, and the
-codebase as it actually is, and were settled before any code was written. The
-fifth arose during implementation, between two things the design itself
-specifies, and was settled by measuring what each runtime actually does and then
-recording the outcome per runtime rather than asserting one of both.
+**Five** conflicts are resolved here, each with its justification. Four are
+conflicts between the technical specifications, the seven constraints, and the
+codebase as it actually is. The fifth is between two things the design itself
+specifies, and it is settled by recording what each runtime measurably does
+rather than asserting a single outcome of both.
 
 ### Conflict 1 - Reflection-guarded shims versus R3
 
@@ -1040,10 +1038,10 @@ inside comments**:
 
 **Justification.** The audit is exhaustive over the test tree, and the
 empirical result corroborates it: `TestUserGroupInformation` passes **41/41 on
-both JDK 17 and JDK 25**, unmodified. The only touch the directives would have
-permitted was rewording those five comments; what was actually done with them
-is recorded under
-[Test-Source Comment Corrections](#Test-Source_Comment_Corrections).
+both JDK 17 and JDK 25**, unmodified. Rewording those five comments was the only
+touch the directives permitted, and it was declined; they are itemized under
+[Test-Source Comment Corrections](#Test-Source_Comment_Corrections), which
+records the two files as left byte-for-byte unchanged.
 
 ### Conflict 4 - A tie-breaker runtime the base commit cannot build on
 
@@ -1115,7 +1113,7 @@ runtime therefore does, which is entry (v) of the
 **Justification.**
 
 * **The fast paths are the mechanism by which JDK 17 support is preserved.** The requirement is not that JDK 17 be *tested* and found working, but that this change cost it nothing: no allocation, no extra frame, behaviour bit-identical to the base commit. Only returning the task unchanged delivers that, and it delivers it by construction rather than by measurement. Removing the first fast path in order to make one assertion read the same on both runtimes would trade a guarantee for a test's convenience.
-* **On a runtime where the flag is `true`, the runtime is already doing the propagating.** `THREAD_INHERITS_SUBJECT` reports that a newly created thread is given its creator's identity. A pool worker is created once and then reused, so what such a runtime propagates to a pooled task is the identity in force when that *worker* was created. Measured on JDK 17 (Temurin 17.0.20+8) on a one-worker pool: a task submitted by `bob` after a task submitted by `alice` observes **`alice`**, and a task submitted with no identity at all also observes **`alice`**. That is exactly the behaviour of the base commit, and exactly the pre-JDK-18 semantics R7 designates as the tie-breaker — see [Conflict 4](#Conflict_4_-_A_tie-breaker_runtime_the_base_commit_cannot_build_on). Changing it would be a behavioural change to a supported runtime, made in the name of a defect that runtime does not have.
+* **On a runtime where the flag is `true`, the runtime is already doing the propagating.** `THREAD_INHERITS_SUBJECT` reports that a newly created thread is given its creator's identity. A pool worker is created once and then reused, so what such a runtime propagates to a pooled task is the identity in force when that *worker* was created. Measured on JDK 17 (Temurin 17.0.20+8) on a one-worker pool: a task submitted by `bob` after a task submitted by `alice` observes **`alice`**, and a task submitted with no identity at all also observes **`alice`**. That is exactly the behaviour of the base commit, and exactly the pre-JDK-18 semantics R7 designates as the tie-breaker — see [Conflict 4](#Conflict_4_-_A_tie-breaker_runtime_the_base_commit_cannot_build_on). It is not, however, the same situation as JDK 25's, and it is worth being exact about the difference rather than describing both as one defect. What JDK 25 does is lose the identity altogether, so pooled work runs with no subject; what such a runtime does is hand a reused worker the identity it was created with, so a task submitted by `bob` can be authorized and audited as `alice` — an identity confusion of its own, measured above and recorded here rather than denied. It is left as it stands because R7 designates the base commit's pre-JDK-18 behaviour as the tie-breaker and because altering it would change what a supported runtime does; a caller there that needs a strictly per-submitter identity has the remedy it always had, which is to establish the identity inside the task, exactly as the nested cases in entry (v) of the [Behavioural Resolution Register](#Behavioural_Resolution_Register) do.
 * **On JDK 25 the guarantee holds strictly, which is where the defect is.** Measured on Temurin 25.0.4+7, the same pool with no fix at all gives a task **no** identity — `Subject.current()` returns `null`, the defect this change exists to close. With the change in place `THREAD_INHERITS_SUBJECT` is `false`, so every submission is prepared and `bob`'s task observes `bob` on the worker `alice` created. The A-then-B test therefore proves the guarantee on the runtime that needs proving.
 * **This is why the tests assert an outcome per runtime.** `TestExecutorSubjectPropagation` states the reuse expectation in terms of `SubjectUtil.THREAD_INHERITS_SUBJECT` rather than asserting one outcome of both runtimes: where the flag is `false` it requires the second submitter's own identity, and where it is `true` it requires the identity the runtime itself carried. Both branches run and assert on both runtimes — nothing is skipped, as recorded under [No conditional-skip mechanism either](#No_conditional-skip_mechanism_either). A test written to demand `bob` on both would not be a stronger test; it would be a test of a mechanism the design deliberately does not use on JDK 17.
 * **The captured-`null` fast path is a correctness requirement, not an optimization.** `Subject.callAs` applies `Objects.requireNonNull` to its action only, so a `null` subject is *bound*, and a binding of nothing masks whatever identity is in force where the task runs. Handing the task back unchanged is the only behaviour that leaves an enclosing identity alone. Its consequence — that a subjectless submission observes whatever its worker happens to hold — is recorded as entry (v) of the register, along with the measurement showing it is unchanged from the base commit on both runtimes.
@@ -1171,7 +1169,7 @@ dequeuing the next. None contains a reflective construct — see
 ### How to reproduce, and what it produced
 
 ```
-source /etc/profile.d/hadoop-build.sh          # JAVA_HOME defaults to JDK 25
+export JAVA_HOME=/path/to/jdk-25
 mvn -B -pl hadoop-common-project/hadoop-common surefire:test \
     -Drequire.test.libhadoop=false \
     -Dtest="TestExecutorSubjectPropagation,TestNestedSubjectPropagation,\
@@ -1193,10 +1191,10 @@ the stale-keystore reason given near the end of
 
 A test that passes against a broken implementation proves nothing, and the
 propagation defect is exactly the kind that a plausible test misses. The suite
-was therefore checked against a deliberately disabled fix: both `wrap` overloads
-in `SubjectPreservingTasks` were made to return their argument unconditionally,
-which reduces the utility to a no-op while leaving every call site and every seam
-override in place. On JDK 25:
+therefore has to fail when the fix is taken away, and it does. Disabling the fix
+means making both `wrap` overloads in `SubjectPreservingTasks` return their
+argument unconditionally, which reduces the utility to a no-op while leaving every
+call site and every seam override in place; on JDK 25 that yields:
 
 | Suite | Result with the fix disabled |
 |---|---|
@@ -1208,8 +1206,8 @@ override in place. On JDK 25:
 `TestThreadFactorySubjectPropagation` staying green is the expected and desirable
 result, not a gap: it covers direct thread creation through
 `SubjectInheritingThread`, which does not go through the task-wrapping utility at
-all. The mutation was reverted and the suite re-run to 70 of 70 before anything
-further was done.
+all. With the utility as it ships, all 70 pass, on both runtimes, as the table
+above records.
 
 ### Constraint-by-constraint verdict
 
@@ -1395,8 +1393,7 @@ fresh JVM per test class, and the fork's `<argLine>` at `:L2566` draws from the
 `maven-surefire-plugin.argLine` property described earlier. Kerberos tests read
 `<java.security.krb5.conf>` from `:L2588`.
 
-One further reproducibility trap, met while measuring the figures above and
-recorded so that nobody mistakes it for a regression: **delete
+One further reproducibility trap, easily mistaken for a regression: **delete
 `hadoop-common-project/hadoop-common/target/test/data` before a run that did not
 begin with `clean`.** Repeated `surefire:test` invocations leave test data in
 that tree, and a keystore left there beside a stale `RawLocalFileSystem`
@@ -1574,16 +1571,18 @@ nothing to change:
 `byte-buddy` **1.17.6** is the decisive pin: it supersedes Mockito 4.11.0's
 transitive **1.12.19**, which cannot instrument JDK 25 class files.
 
-**Two beliefs were refuted by measurement and must not be reintroduced.** First,
-that a Mockito or `byte-buddy` upgrade is required — it is not; the existing pin
-works, and `hadoop-common-project` contains **zero** `mockStatic` and **zero**
-`mockConstruction` usages, so no dynamic-agent self-attachment is needed
-anywhere in this module tree. Scope that count to `hadoop-common-project`: a
-repository-wide search finds 5 `mockStatic` files, all of them under
+**Two changes that JDK 25 appears to require are measurably unnecessary, and
+must not be introduced.** First, a Mockito or `byte-buddy` upgrade: the existing
+pin works, and `hadoop-common-project` contains **zero** `mockStatic` and
+**zero** `mockConstruction` usages, so no dynamic-agent self-attachment is
+needed anywhere in this module tree. Scope that count to
+`hadoop-common-project`: a repository-wide search finds 5 `mockStatic` files, all
+of them under
 `hadoop-yarn-project/.../hadoop-yarn-server-timelineservice-documentstore`,
-which is out of scope here and unaffected by this change. Second, that plugin
-version bumps are required — they are not. Acting on either belief would
-introduce hunks that trace to no defect, violating R1.
+which is out of scope here and unaffected by this change. Second, plugin version
+bumps: every plugin version pinned in this repository is already the JDK-25
+minimum, as the table above records. Either change would introduce hunks that
+trace to no defect, violating R1.
 
 The propagation design draws only on `java.util.concurrent`,
 `java.util.Objects`, `java.security.PrivilegedAction` and its relatives,

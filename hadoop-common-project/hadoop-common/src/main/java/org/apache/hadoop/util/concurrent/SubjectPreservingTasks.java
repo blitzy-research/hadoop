@@ -28,72 +28,56 @@ import org.apache.hadoop.classification.InterfaceAudience;
 import org.apache.hadoop.security.authentication.util.SubjectUtil;
 
 /**
- * Carries the current JAAS subject from the thread that submits a task to the
- * pooled thread that runs it.
+ * Carries the JAAS subject of the thread that submits a task to the pooled
+ * thread that runs it, on a runtime that no longer carries it across a thread
+ * boundary itself.
  * <p>
- * Up to and including Java 21 the runtime gave a newly created thread the
- * subject of the thread that created it, and Hadoop relied on that: work handed
- * to a thread pool created inside a {@code doAs} scope reached its worker with
- * the caller's identity in place. From Java 24 a new thread never inherits it,
- * so that work now reaches its worker with no identity at all. Nothing reports
- * this: such code compiles, throws nothing and logs nothing, and the loss
- * surfaces later as a denied authorization, as an audit record naming the wrong
- * user, or as a {@link NullPointerException} far from its cause.
+ * Up to and including Java 21 a newly created thread was given the subject of
+ * the thread that created it, and Hadoop relied on that. From Java 24 it is
+ * given none, so work handed to a pool inside a {@code doAs} scope reaches its
+ * worker with no identity at all -- and nothing reports it: such code compiles,
+ * throws nothing and logs nothing, and the loss surfaces later as a denied
+ * authorization, an audit record naming the wrong user, or a
+ * {@link NullPointerException} far from its cause.
  * <p>
- * The methods here close that gap at the point where a task is handed over.
- * {@link #wrap(Runnable)} and {@link #wrap(Callable)} read the subject of the
- * thread that calls them and return a task that re-establishes it, for the
- * duration of that task, on whichever thread eventually runs it. Because they
- * are called on the submitting thread, the subject is read at submission rather
- * than at worker creation, so a pool that reuses its threads runs each task
- * under the identity of that task's own submitter rather than under the identity
- * that happened to cause the worker to exist.
- * <p>
- * A task is handed straight back, with nothing allocated and nothing to
- * re-establish, in four cases:
+ * What a pooled task runs under therefore depends on the runtime, and is stated
+ * here per runtime rather than in the abstract:
  * <ul>
- *   <li>the running JVM still hands a newly created thread the subject of its
- *   creator, as {@link SubjectUtil#THREAD_INHERITS_SUBJECT} reports for Java 21
- *   and earlier. Such a runtime carries the identity across the thread boundary
- *   itself, so this class stays out of its way entirely and leaves its
- *   behaviour, and its cost, exactly as they were before this migration;</li>
- *   <li>the submitting thread carries no subject. Re-establishing an absent
- *   identity is not the same as leaving one out: the replacement API accepts a
- *   {@code null} subject and binds it, so passing one on would hide an
- *   identity in force where the task runs instead of leaving the task with
- *   none;</li>
- *   <li>the task is {@code null}, so that the executor it was destined for
- *   rejects it exactly as it always has, at the moment it is handed over;</li>
- *   <li>the task already carries an identity read by one of these methods, so
- *   that a rejected task an executor is offered a second time -- as
- *   {@link java.util.concurrent.ThreadPoolExecutor.DiscardOldestPolicy} offers
- *   it -- keeps the single layer that {@link #unwrap(Runnable)} takes back off,
- *   and keeps the identity of the submission that was rejected rather than
- *   picking up whichever identity happens to be current on the retry.</li>
+ *   <li>where {@link SubjectUtil#THREAD_INHERITS_SUBJECT} is {@code false} --
+ *   Java 24 and later, JDK 25 among them -- {@link #wrap(Runnable)} and
+ *   {@link #wrap(Callable)} read the subject on the thread that calls them and
+ *   return a task that re-establishes it around the original. They are called
+ *   on the submitting thread, so the subject is read at submission rather than
+ *   at worker creation, and a pool that reuses its threads runs each task under
+ *   the identity of that task's own submitter;</li>
+ *   <li>where it is {@code true} -- Java 21 and earlier, JDK 17 among them --
+ *   the runtime propagates the identity itself, both methods return their
+ *   argument, and a task observes whatever its worker holds: the identity in
+ *   force when that worker was created, as a worker built by
+ *   {@link SubjectInheritingThread} takes one, or none where the worker was
+ *   given none. Behaviour and cost are left exactly as that runtime already had
+ *   them.</li>
  * </ul>
- * What a task handed back unchanged observes is therefore whatever its worker
- * holds: nothing at all on a worker that was given no identity of its own, and
- * the worker's own identity where it took one when it was created, as a worker
- * built by {@link SubjectInheritingThread} does. That is what such a task
- * observed on every runtime this project supported before this migration, and
- * it is recorded, with its consequences, under "Behavioural resolutions" in
- * {@code JDK25Migration.md}.
+ * A task is handed back unchanged for three further reasons: the submitting
+ * thread carries no subject, the task is {@code null}, or the task was already
+ * prepared here. The first is a matter of correctness rather than economy --
+ * the replacement API binds a {@code null} subject, so re-establishing an
+ * absent identity would hide an identity in force where the task runs instead
+ * of leaving the task with none. The second leaves an executor's own rejection
+ * of a {@code null} task where it was, and the third keeps a task an executor
+ * is offered a second time carrying the identity of the submission that was
+ * rejected, behind the single layer {@link #unwrap(Runnable)} takes off.
  * <p>
- * Where an identity is re-established, nothing else about the task changes. The
- * identity is applied through {@code SubjectUtil.doAs} rather than through the
- * replacement API directly, because only {@code doAs} unwraps the
- * {@link java.util.concurrent.CompletionException} that the replacement API is
- * specified to throw and re-throws the original cause: an exception a task
- * throws therefore keeps its own type, and stays the cause a
- * {@link java.util.concurrent.Future} reports on its
- * {@link java.util.concurrent.ExecutionException}. The future a submitter holds
- * is still the executor's own, because an executor builds that future before it
- * hands the work on, and every place that describes a queued task rather than
- * running it takes this layer back off with {@link #unwrap(Runnable)} first, so
- * what such a place reports is the task that was submitted.
+ * Where an identity is re-established, nothing else about the task changes. It
+ * is applied with {@code SubjectUtil.doAs} rather than the replacement API
+ * directly, because only {@code doAs} unwraps the
+ * {@link java.util.concurrent.CompletionException} that API is specified to
+ * throw and re-throws the original cause: an exception a task throws keeps its
+ * own type, and stays the cause a {@link java.util.concurrent.Future} reports
+ * on its {@link java.util.concurrent.ExecutionException}.
  * <p>
- * Wrapping belongs at a single point per executor, so that no call site need
- * know of any of this, and code that inspects a task instead of running it calls
+ * Wrapping belongs at one point per executor, so that no call site need know of
+ * any of this, and code that describes a task instead of running it calls
  * {@link #unwrap(Runnable)} first. This class covers a task handed to a pool;
  * {@link SubjectInheritingThread} covers a thread created and started directly.
  */
@@ -104,18 +88,14 @@ public final class SubjectPreservingTasks {
   }
 
   /**
-   * Returns a task that runs {@code task} under the subject current on this
-   * thread.
+   * Prepares {@code task} so that it runs under the subject current on this
+   * thread, wherever this class wraps at all.
    * <p>
    * The subject is read here, on the calling thread, and applied on whichever
-   * thread runs the task, so a task submitted to a pool runs under the identity
-   * of its own submitter. The argument is returned unchanged in the four cases
-   * this class documents: a runtime that hands a new thread its creator's
-   * subject, a calling thread carrying no subject, a {@code null} task, and a
-   * task already prepared here.
-   * <p>
-   * An exception thrown by {@code task} propagates with its own type, because
-   * establishing the identity contributes no exception of its own.
+   * thread runs the task. The argument is returned unchanged in the four cases
+   * the class contract lists -- a runtime that propagates the subject itself, a
+   * calling thread carrying no subject, a {@code null} task, and a task already
+   * prepared here -- and such a task observes whatever its worker holds.
    *
    * @param task the task to run under the current subject; may be {@code null}
    * @return a task that establishes the calling thread's subject, or
@@ -135,17 +115,13 @@ public final class SubjectPreservingTasks {
   }
 
   /**
-   * Returns a task that calls {@code task} under the subject current on this
-   * thread.
+   * The {@link Callable} counterpart of {@link #wrap(Runnable)}, on exactly the
+   * same terms.
    * <p>
-   * This is the {@link Callable} counterpart of {@link #wrap(Runnable)}: it
-   * reads the subject on exactly the same terms and returns the argument
-   * unchanged in exactly the same four cases.
-   * <p>
-   * An exception thrown by {@code task} keeps its own type, whether it is
-   * checked or unchecked, so a caller reading the result through a future is
-   * handed an {@link java.util.concurrent.ExecutionException} whose cause is the
-   * exception the task itself threw.
+   * An exception thrown by {@code task} keeps its own type, checked or
+   * unchecked, so a caller reading the result through a future is handed an
+   * {@link java.util.concurrent.ExecutionException} whose cause is the exception
+   * the task itself threw.
    *
    * @param <T> the result type of the task
    * @param task the task to call under the current subject; may be {@code null}
@@ -166,19 +142,16 @@ public final class SubjectPreservingTasks {
   }
 
   /**
-   * Returns the task that {@link #wrap(Runnable)} was given, when {@code task}
-   * is one of the tasks it returned.
+   * Returns the task {@link #wrap(Runnable)} was given, when {@code task} is one
+   * it returned; anything else, {@code null} included, is returned as it is.
    * <p>
-   * Anything else, {@code null} included, is returned as it is. This lets code
-   * that inspects a task instead of running it see the task as it was
-   * submitted, which matters because a prepared task is neither a
+   * This lets code that describes a task instead of running it see the task as
+   * it was submitted, which matters because a prepared task is neither a
    * {@link java.util.concurrent.Future} nor of the class the submitter passed
-   * in.
-   * <p>
-   * Exactly one layer is removed. Wrapping is applied at a single point per
+   * in. Exactly one layer is removed: wrapping is applied at one point per
    * executor and an already-prepared task is left alone, so one layer is all
-   * there is to remove, and stopping after one leaves a mistaken second layer
-   * visible instead of concealing it.
+   * there is, and stopping after one leaves a mistaken second layer visible
+   * instead of concealing it.
    *
    * @param task the task to unwrap; may be {@code null}
    * @return the task that was prepared, or {@code task} itself when it was not
@@ -197,13 +170,6 @@ public final class SubjectPreservingTasks {
   private static final class SubjectPreservingRunnable implements Runnable {
 
     private final Runnable delegate;
-
-    /**
-     * The subject read on the submitting thread, never {@code null}: a
-     * submission carrying no subject is handed back unprepared, so that its
-     * task is not run with an absent identity established over whatever is in
-     * force where it runs.
-     */
     private final Subject subject;
 
     SubjectPreservingRunnable(Runnable delegate, Subject subject) {
@@ -213,12 +179,11 @@ public final class SubjectPreservingTasks {
 
     @Override
     public void run() {
-      // doAs rather than callAs: callAs reports a failure of the delegate as the
-      // cause of an exception of its own, whereas doAs re-throws what the
-      // delegate threw. That leaves the delegate's own exception as the cause a
-      // future reports on its ExecutionException, and as what a pool's own
-      // reporting of an uncaught failure observes. This overload declares no
-      // checked exception, so nothing has to be caught.
+      // doAs rather than callAs, so that the delegate's own exception is what
+      // propagates and so becomes the cause a future reports on its
+      // ExecutionException, and what a pool's own reporting of an uncaught
+      // failure observes. This overload declares no checked exception, so
+      // nothing has to be caught.
       SubjectUtil.doAs(subject, (PrivilegedAction<Void>) () -> {
         delegate.run();
         return null;
@@ -235,11 +200,6 @@ public final class SubjectPreservingTasks {
       implements Callable<T> {
 
     private final Callable<T> delegate;
-
-    /**
-     * The subject read on the submitting thread, never {@code null}, for the
-     * reason given in {@link SubjectPreservingRunnable}.
-     */
     private final Subject subject;
 
     SubjectPreservingCallable(Callable<T> delegate, Subject subject) {
@@ -250,11 +210,10 @@ public final class SubjectPreservingTasks {
     @Override
     public T call() throws Exception {
       try {
-        // doAs rather than callAs, so that the delegate's own exception is the
-        // one that propagates and so becomes the cause a future reports on its
-        // ExecutionException. A runtime exception never reaches the handler
-        // below, because this overload re-throws one directly; only a checked
-        // exception arrives wrapped, and its cause restores the type thrown.
+        // doAs rather than callAs, for the reason given above. A runtime
+        // exception never reaches the handler below, because this overload
+        // re-throws one directly; only a checked exception arrives wrapped, and
+        // its cause restores the type thrown.
         return SubjectUtil.doAs(subject,
             (PrivilegedExceptionAction<T>) delegate::call);
       } catch (PrivilegedActionException e) {

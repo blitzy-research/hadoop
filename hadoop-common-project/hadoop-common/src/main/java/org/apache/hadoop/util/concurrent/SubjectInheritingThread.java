@@ -48,12 +48,12 @@ import org.apache.hadoop.security.authentication.util.SubjectUtil;
  * started with for the whole of its working life, one task after another, so a
  * task arriving with an identity of its own has to have that identity
  * established over the worker's; {@link SubjectPreservingTasks#wrap(Runnable)}
- * does so, reading the identity on the submitting thread. Where a submission
- * carries no identity, and on a runtime that hands a new thread its creator's
- * Subject, such a task is passed on untouched and observes the worker's own
- * Subject, which is what it observed on every runtime this project supported
- * before the migration; that outcome is recorded under "Behavioural
- * resolutions" in {@code JDK25Migration.md}.
+ * does so, reading the identity on the submitting thread. It does so wherever
+ * {@link SubjectUtil#THREAD_INHERITS_SUBJECT} is {@code false}, which is Java 24
+ * and later. Where that flag is {@code true}, which is Java 21 and earlier, and
+ * wherever a submission carries no identity at all, such a task is passed on
+ * untouched and observes its worker's own Subject: the identity in force when
+ * the worker was started, or none where the worker was started with none.
  * <p>
  * When specifying a Runnable, this class is used in exactly the same way as
  * Thread.

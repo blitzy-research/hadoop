@@ -33,14 +33,22 @@ import java.util.concurrent.TimeUnit;
 /** An extension of ScheduledThreadPoolExecutor that provides additional
  * functionality.
  * <p>
- * Every task handed to this pool runs under the subject current on the thread
- * that handed it over, established by
+ * A task handed to this pool passes through
  * {@link SubjectPreservingTasks#wrap(Runnable)} in the four scheduling methods
- * below. Those four are the whole of the pool's intake:
+ * below, which are the whole of the pool's intake:
  * {@code ScheduledThreadPoolExecutor} routes {@code execute} and all three
  * {@code submit} overloads through {@code schedule}, so overriding them as well
  * would prepare a task twice over and leave a second layer behind the one
- * {@link SubjectPreservingTasks#unwrap(Runnable)} takes off. */
+ * {@link SubjectPreservingTasks#unwrap(Runnable)} takes off.
+ * <p>
+ * Where that utility wraps -- wherever
+ * {@code SubjectUtil.THREAD_INHERITS_SUBJECT} is {@code false}, JDK 25 among
+ * those runtimes -- a task runs under the subject current on the thread that
+ * scheduled it, and a repeating task under that same subject on every one of its
+ * executions. Where the runtime propagates the subject itself, or scheduling
+ * carries none at all, the task is passed on unchanged and observes whatever its
+ * worker holds: the identity in force when that worker was created, or none
+ * where the worker was given none. */
 public class HadoopScheduledThreadPoolExecutor extends
     ScheduledThreadPoolExecutor {
 
@@ -68,8 +76,8 @@ public class HadoopScheduledThreadPoolExecutor extends
   }
 
   /**
-   * Schedules a task to be run once, after the given delay, under the subject
-   * current on the scheduling thread.
+   * Schedules a task to be run once, after the given delay, prepared on the
+   * terms the class contract states.
    *
    * @param command the task to run
    * @param delay how long to wait before running the task
@@ -83,8 +91,8 @@ public class HadoopScheduledThreadPoolExecutor extends
   }
 
   /**
-   * Schedules a task to be called once, after the given delay, under the
-   * subject current on the scheduling thread.
+   * Schedules a task to be called once, after the given delay, prepared on the
+   * terms the class contract states.
    *
    * @param <V> the result type of the task
    * @param callable the task to call
@@ -99,13 +107,12 @@ public class HadoopScheduledThreadPoolExecutor extends
   }
 
   /**
-   * Schedules a task to be run over and over at the given rate, under the
-   * subject current on the scheduling thread, beginning after the given initial
-   * delay.
+   * Schedules a task to be run over and over at the given rate, beginning after
+   * the given initial delay, prepared on the terms the class contract states.
    * <p>
-   * Every execution runs under that subject, and not the first alone, because
-   * the subject is read once when the schedule is created and re-established on
-   * each run.
+   * Where a subject is established at all it is established on every execution,
+   * and not the first alone, because it is read once when the schedule is
+   * created and re-established on each run.
    *
    * @param command the task to run
    * @param initialDelay how long to wait before the first execution
@@ -122,10 +129,11 @@ public class HadoopScheduledThreadPoolExecutor extends
 
   /**
    * Schedules a task to be run over and over with the given delay between one
-   * execution and the next, under the subject current on the scheduling thread,
-   * beginning after the given initial delay.
+   * execution and the next, beginning after the given initial delay, prepared on
+   * the terms the class contract states.
    * <p>
-   * Every execution runs under that subject, and not the first alone.
+   * Where a subject is established at all it is established on every execution,
+   * and not the first alone.
    *
    * @param command the task to run
    * @param initialDelay how long to wait before the first execution
