@@ -38,19 +38,22 @@ import org.apache.hadoop.security.authentication.util.SubjectUtil;
  * <p>
  * This mechanism covers threads: the Subject is captured in {@link #start()} on
  * the thread that starts this one, and re-established for the whole lifetime of
- * the new thread by {@link #run()}. It cannot cover tasks submitted to a thread
- * pool, because a capture taken once per worker thread would bind the identity
- * that triggered that worker's creation, and every later task the worker runs
- * would execute under it. Pooled tasks are therefore handled by capturing the
- * Subject at task submission instead; see {@link SubjectPreservingTasks}.
+ * the new thread by {@link #run()}. It cannot cover a task submitted to a thread
+ * pool, because a capture taken once per worker binds the identity that caused
+ * that worker to exist, and every later task the worker runs would execute under
+ * it. A task handed to a pool is therefore prepared at the moment it is
+ * submitted instead; see {@link SubjectPreservingTasks}.
  * <p>
  * An instance of this class used as a pool worker holds the Subject it was
- * started with for the whole of its working life, one task after another. A
- * pooled task therefore has to be given the identity of its own submission even
- * when that submission carries no identity at all, or it would run as whichever
- * submitter caused its worker to be created; that is what
- * {@link SubjectPreservingTasks#wrap(Runnable)} is for, and it is why
- * every executor Hadoop owns prepares tasks through it.
+ * started with for the whole of its working life, one task after another, so a
+ * task arriving with an identity of its own has to have that identity
+ * established over the worker's; {@link SubjectPreservingTasks#wrap(Runnable)}
+ * does so, reading the identity on the submitting thread. Where a submission
+ * carries no identity, and on a runtime that hands a new thread its creator's
+ * Subject, such a task is passed on untouched and observes the worker's own
+ * Subject, which is what it observed on every runtime this project supported
+ * before the migration; that outcome is recorded under "Behavioural
+ * resolutions" in {@code JDK25Migration.md}.
  * <p>
  * When specifying a Runnable, this class is used in exactly the same way as
  * Thread.
@@ -91,8 +94,8 @@ public class SubjectInheritingThread extends Thread {
    * Behaves similarly to {@link Thread#Thread(ThreadGroup, Runnable)}
    * constructor.
    *
-   * @param group  the thread group. When {@code null}, the group is chosen as
-   *               the corresponding {@link Thread} constructor chooses it.
+   * @param group  the thread group. If {@code null}, the group is set to the
+   *               current thread's thread group.
    *
    * @param target the object whose {@code run} method is invoked when this thread
    *               is started. If {@code null}, this thread's run method is
@@ -136,8 +139,8 @@ public class SubjectInheritingThread extends Thread {
   /**
    * Behaves similarly to {@link Thread#Thread(ThreadGroup, String)} constructor.
    *
-   * @param group the thread group. When {@code null}, the group is chosen as the
-   *              corresponding {@link Thread} constructor chooses it.
+   * @param group the thread group. If {@code null}, the group is set to the
+   *              current thread's thread group.
    *
    * @param name  the name of the new thread
    */
@@ -149,8 +152,8 @@ public class SubjectInheritingThread extends Thread {
    * Behaves similarly to {@link Thread#Thread(ThreadGroup, Runnable, String)}
    * constructor.
    *
-   * @param group  the thread group. When {@code null}, the group is chosen as
-   *               the corresponding {@link Thread} constructor chooses it.
+   * @param group  the thread group. If {@code null}, the group is set to the
+   *               current thread's thread group.
    *
    * @param target the object whose {@code run} method is invoked when this thread
    *               is started. If {@code null}, this thread's run method is

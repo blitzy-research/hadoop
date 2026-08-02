@@ -80,16 +80,16 @@ import org.apache.hadoop.classification.InterfaceAudience.Private;
  * them, so the compiler resolves no reference to any of them.
  * <p>
  * {@link #THREAD_INHERITS_SUBJECT} reports one thing only: whether the running
- * JVM still hands the current subject to a thread it is asked to create. It
- * says nothing about a thread that already exists, so it cannot stand in for a
- * task reaching a worker that was created earlier, and for someone else.
- * Code that has to re-establish an identity on
- * another thread reads the subject with {@link #current()} on the thread that
- * still carries it, then applies it on the other thread through one of the
- * {@code doAs} overloads rather than through {@code callAs}: only the
- * {@code doAs} overloads unwrap the {@link CompletionException} that the
- * replacement API is specified to throw, and re-throw the original cause, so
- * the exception a caller observes is unchanged by this migration.
+ * JVM still hands the current subject to a thread it is asked to create. It is
+ * the guard code uses to tell a runtime that carries an identity across a
+ * thread boundary from one that does not, and so to stay out of the way of the
+ * former entirely. Where it has to carry the identity itself, such code reads
+ * the subject with {@link #current()} on the thread that still carries it, then
+ * applies it on the other thread through one of the {@code doAs} overloads
+ * rather than through {@code callAs}: only the {@code doAs} overloads unwrap the
+ * {@link CompletionException} that the replacement API is specified to throw,
+ * and re-throw the original cause, so the exception a caller observes is
+ * unchanged by this migration.
  * <p>
  * Throughout the class an action is required and a subject is not: every
  * overload rejects a {@code null} action, while a {@code null} subject is legal
@@ -130,16 +130,17 @@ public final class SubjectUtil {
    * risking its loss. Code that only needs to carry the subject across a boundary
    * the JVM no longer crosses for it can guard on this flag and so reduce to a
    * provable no-op on JDK 17.
-   * Handing a task to a thread that already exists is a different boundary, and
-   * this flag does not report on it: no runtime hands such a task the subject of
-   * whoever submitted it, and a worker given a subject of its own when it was
-   * created goes on holding that one while it runs the tasks of one submitter
-   * after another. Code that carries the subject across that boundary therefore
-   * reads it with {@link #current()} at every submission and applies it for that
-   * one task, whatever this flag reports; and it does so even where
-   * {@link #current()} finds nothing, because a task submitted with no subject
-   * has to run with none rather than under whichever subject its worker was left
-   * holding.
+   * <p>
+   * Handing a task to a worker that already exists is a different boundary from
+   * creating a thread, and this flag guards both: where it is {@code true} the
+   * runtime carries the subject into a thread it creates, and Hadoop leaves that
+   * runtime's behaviour, and its cost, exactly as they were; where it is
+   * {@code false} the subject is read at each submission with {@link #current()}
+   * and applied for that one task. A worker given a subject of its own when it
+   * was created goes on holding that one while it runs the tasks of one submitter
+   * after another, so on a runtime that still inherits, and for a submission that
+   * carries no subject at all, a task observes its worker's subject rather than
+   * its submitter's.
    */
   public static final boolean THREAD_INHERITS_SUBJECT = checkThreadInheritsSubject();
 

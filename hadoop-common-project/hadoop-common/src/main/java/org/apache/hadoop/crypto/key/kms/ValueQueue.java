@@ -36,7 +36,6 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
 import org.apache.hadoop.classification.VisibleForTesting;
 import org.apache.hadoop.util.Preconditions;
 import org.apache.hadoop.util.concurrent.HadoopThreadPoolExecutor;
-import org.apache.hadoop.util.concurrent.SubjectPreservingTasks;
 import org.apache.hadoop.thirdparty.com.google.common.cache.CacheBuilder;
 import org.apache.hadoop.thirdparty.com.google.common.cache.CacheLoader;
 import org.apache.hadoop.thirdparty.com.google.common.cache.LoadingCache;
@@ -97,57 +96,13 @@ public class ValueQueue <E> {
 
   /**
    * A <code>Runnable</code> which takes a string name.
-   * <p>
-   * A refill task is put straight into the queue that backs the filler pool
-   * rather than submitted through the pool, as
-   * {@link ValueQueue#submitRefillTask(String, Queue)} explains, and so it never
-   * passes the one point at which the pool carries the queueing thread's JAAS
-   * subject over to the filler thread that runs it. The identity to refill under
-   * is therefore read here, in a constructor that runs on the thread whose
-   * request made the refill necessary, and {@link #fill()} is run through the
-   * task that {@link SubjectPreservingTasks#wrap(Runnable)} hands back.
-   * <p>
-   * That matters because a refill reaches the key provider as whoever is current
-   * when it runs: {@code KMSClientProvider} reads
-   * {@link org.apache.hadoop.security.UserGroupInformation#getCurrentUser()} to
-   * decide which user to authenticate as and whether the request is being made
-   * on behalf of a proxied user. With no identity in force that call falls back
-   * to the logged-in user, so keys would be generated as the service rather than
-   * as the user who asked for them, and the audit record would name the service
-   * too. Reading the identity when the refill is queued makes a refill run as
-   * the user whose request emptied the queue, or as nobody at all when that
-   * request had no identity, instead of as whoever happened to cause a filler
-   * thread to be created.
-   * <p>
-   * What goes into the queue is still the <code>NamedRunnable</code> itself. The
-   * subject is carried inside it rather than around it, so the queue's tracking
-   * of the keys being filled, {@link #cancel()}, and the removal by object
-   * identity in {@link ValueQueue#drain(String)} all continue to work on exactly
-   * the object they always did.
    */
   private abstract static class NamedRunnable implements Runnable {
     final String name;
     private AtomicBoolean canceled = new AtomicBoolean(false);
-    /** {@link #fill()} bound to the identity that queued this task. */
-    private final Runnable subjectPreservingFill;
-
     private NamedRunnable(String keyName) {
       this.name = keyName;
-      this.subjectPreservingFill = SubjectPreservingTasks.wrap(this::fill);
     }
-
-    /**
-     * Fills the queue for this task's key under the identity that queued it.
-     */
-    @Override
-    public final void run() {
-      subjectPreservingFill.run();
-    }
-
-    /**
-     * Fills the queue for this task's key.
-     */
-    abstract void fill();
 
     public void cancel() {
       canceled.set(true);
@@ -196,12 +151,6 @@ public class ValueQueue <E> {
    *
    * NOTE: Only methods that ware explicitly called by the
    * <code>ThreadPoolExecutor</code> need to be over-ridden.
-   *
-   * Every task in this queue is a <code>NamedRunnable</code>, which is what
-   * lets the methods below read a task's key name and cancel it. A task that
-   * runs under the subject of the thread that queued it therefore has to be a
-   * <code>NamedRunnable</code> that establishes that subject itself, rather
-   * than a wrapper placed around one.
    */
   private static class UniqueKeyBlockingQueue extends
       LinkedBlockingQueue<Runnable> {
@@ -477,23 +426,11 @@ public class ValueQueue <E> {
     }
     // The submit/execute method of the ThreadPoolExecutor is bypassed and
     // the Runnable is directly put in the backing BlockingQueue so that we
-    // can control exactly how the runnable is inserted into the queue. That
-    // also bypasses the point at which the pool would carry this thread's JAAS
-    // subject over to the filler thread, which NamedRunnable therefore takes
-    // care of itself: it is created here, on the thread whose request made this
-    // refill necessary, and reads the identity to refill under as it is built.
-    // What goes into the queue is still the NamedRunnable itself, so key
-    // de-duplication and the object identity that drain() relies on are
-    // unaffected.
+    // can control exactly how the runnable is inserted into the queue.
     queue.put(
         new NamedRunnable(keyName) {
-
-          /**
-           * Refills the queue for the key this task names, unless the task was
-           * cancelled or the queue has meanwhile risen back to the watermark.
-           */
           @Override
-          void fill() {
+          public void run() {
             int cacheSize = numValues;
             int threshold = (int) (lowWatermark * (float) cacheSize);
             // Need to ensure that only one refill task per key is executed
