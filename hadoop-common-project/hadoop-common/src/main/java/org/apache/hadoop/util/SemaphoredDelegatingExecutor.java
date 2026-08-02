@@ -24,9 +24,6 @@ import org.apache.hadoop.thirdparty.com.google.common.util.concurrent.Futures;
 import org.apache.hadoop.classification.InterfaceAudience;
 import org.apache.hadoop.fs.statistics.DurationTracker;
 import org.apache.hadoop.fs.statistics.DurationTrackerFactory;
-import org.apache.hadoop.util.concurrent.HadoopScheduledThreadPoolExecutor;
-import org.apache.hadoop.util.concurrent.HadoopThreadPoolExecutor;
-import org.apache.hadoop.util.concurrent.SubjectPreservingExecutorService;
 import org.apache.hadoop.util.concurrent.SubjectPreservingTasks;
 
 import java.util.Collection;
@@ -66,14 +63,6 @@ public class SemaphoredDelegatingExecutor extends
   private final DurationTrackerFactory trackerFactory;
 
   /**
-   * Whether the executor this forwards to establishes the submitting thread's
-   * identity for a task on its own account, so that doing so here as well would
-   * add a layer that changes nothing. Settled once, when this executor is built,
-   * because the executor forwarded to never changes.
-   */
-  private final boolean delegateCarriesIdentity;
-
-  /**
    * Instantiate.
    * @param executorDelegatee Executor to delegate to
    * @param permitCount number of permits into the queue permitted
@@ -88,69 +77,9 @@ public class SemaphoredDelegatingExecutor extends
     this.permitCount = permitCount;
     queueingPermits = new Semaphore(permitCount, fair);
     this.executorDelegatee = requireNonNull(executorDelegatee);
-    this.delegateCarriesIdentity = carriesIdentityItself(executorDelegatee);
     this.trackerFactory = trackerFactory != null
         ? trackerFactory
         : stubDurationTrackerFactory();
-  }
-
-  /**
-   * Reports whether {@code delegate} establishes the submitting thread's identity
-   * for every task it is given, so that this executor need not do so as well.
-   * <p>
-   * Every executor named here does it for each of its own submission methods, on
-   * whichever of them a task arrives by, and each is reached from here by a
-   * direct call on the submitting thread. The identity such an executor captures
-   * is therefore the same identity, from the same thread, at the same moment as
-   * one captured here would be, which is what makes leaving it to the delegate
-   * exact rather than approximate.
-   * <p>
-   * Anything else is assumed not to, which is the safe way round: preparing a
-   * task that did not need it costs a layer, while failing to prepare one that
-   * did means running it as whatever identity its worker was already holding.
-   * That covers the plain thread pool this class is most often given -- the one
-   * {@link BlockingThreadPoolExecutorService} builds for itself, which is why
-   * that subclass still prepares its own tasks -- and every executor handed to
-   * Hadoop from outside.
-   * <p>
-   * The question is asked once per executor rather than once per task, so
-   * recognising the case costs nothing at submission time.
-   *
-   * @param delegate the executor this one forwards to
-   * @return whether that executor already establishes a submitter's identity
-   */
-  private static boolean carriesIdentityItself(ExecutorService delegate) {
-    return delegate instanceof SemaphoredDelegatingExecutor
-        || delegate instanceof HadoopThreadPoolExecutor
-        || delegate instanceof HadoopScheduledThreadPoolExecutor
-        || delegate instanceof SubjectPreservingExecutorService;
-  }
-
-  /**
-   * Returns {@code task} ready to run under the identity of the thread
-   * submitting it, or unchanged when the executor forwarded to will see to that.
-   *
-   * @param task the task being submitted
-   * @return the task to hand on
-   */
-  private Runnable prepare(Runnable task) {
-    return delegateCarriesIdentity
-        ? task
-        : SubjectPreservingTasks.wrap(task);
-  }
-
-  /**
-   * Returns {@code task} ready to be called under the identity of the thread
-   * submitting it, or unchanged when the executor forwarded to will see to that.
-   *
-   * @param <T> the result type of the task
-   * @param task the task being submitted
-   * @return the task to hand on
-   */
-  private <T> Callable<T> prepare(Callable<T> task) {
-    return delegateCarriesIdentity
-        ? task
-        : SubjectPreservingTasks.wrap(task);
   }
 
   /**
@@ -206,7 +135,7 @@ public class SemaphoredDelegatingExecutor extends
       Thread.currentThread().interrupt();
       return Futures.immediateFailedFuture(e);
     }
-    return super.submit(new CallableWithPermitRelease<>(prepare(task)));
+    return super.submit(new CallableWithPermitRelease<>(SubjectPreservingTasks.wrap(task)));
   }
 
   @Override
@@ -218,7 +147,7 @@ public class SemaphoredDelegatingExecutor extends
       Thread.currentThread().interrupt();
       return Futures.immediateFailedFuture(e);
     }
-    return super.submit(new RunnableWithPermitRelease(prepare(task)), result);
+    return super.submit(new RunnableWithPermitRelease(SubjectPreservingTasks.wrap(task)), result);
   }
 
   @Override
@@ -230,7 +159,7 @@ public class SemaphoredDelegatingExecutor extends
       Thread.currentThread().interrupt();
       return Futures.immediateFailedFuture(e);
     }
-    return super.submit(new RunnableWithPermitRelease(prepare(task)));
+    return super.submit(new RunnableWithPermitRelease(SubjectPreservingTasks.wrap(task)));
   }
 
   @Override
@@ -241,7 +170,7 @@ public class SemaphoredDelegatingExecutor extends
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
     }
-    super.execute(new RunnableWithPermitRelease(prepare(command)));
+    super.execute(new RunnableWithPermitRelease(SubjectPreservingTasks.wrap(command)));
   }
 
   /**

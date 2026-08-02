@@ -108,11 +108,22 @@ import org.apache.hadoop.security.authentication.util.SubjectUtil;
  * therefore the executor letting go of the prepared task -- a worker finishing
  * with it, the task being removed, or the pool being stopped -- and an executor
  * that lets a caller cancel work owes it that release without being asked
- * again. Every executor here obtains it by construction, because the prepared
- * task is what the cancelled future was given to run and a completed future
- * lets go of that; a pool that instead prepares a task around a future it was
- * handed reclaims the queued entry when the future is cancelled, which is what
- * {@link HadoopThreadPoolExecutor} does.
+ * again. An executor that prepares the task a future is given to run obtains
+ * that release by construction, because a future that has completed,
+ * cancellation included, lets go of what it was given; the forwarding executor
+ * services here work that way. A pool that instead prepares a task
+ * <em>around</em> a future it was handed cannot rely on that, so
+ * {@link HadoopThreadPoolExecutor} and
+ * {@link HadoopScheduledThreadPoolExecutor} each reclaim what a submission for
+ * one result leaves behind: such a submission queues, for every task, a future
+ * of the completion service's making that nothing ever cancels, and each pool
+ * takes back whatever of that is still waiting once the submission has ended.
+ * {@link HadoopThreadPoolExecutor} gives up in addition the place of a future it
+ * made itself, the moment that future is cancelled. What a pool cannot be told
+ * about -- a future a caller made and handed over as a plain task, a completion
+ * service a caller drives over the pool itself, or, on a scheduled pool, an
+ * entry of the pool's own that a caller cancels -- is reclaimed by a sweep of
+ * the queue, or when the queue next drains.
  * <p>
  * Wrapping belongs at a single point per executor, so that no call site need
  * know of any of this, and code that inspects a task instead of running it
@@ -216,13 +227,17 @@ public final class SubjectPreservingTasks {
    * has passed, every task is still prepared on the submitting thread and under
    * the identity that submitted it.
    *
+   * This is for the executors of this package to reach; a call site hands over
+   * one task at a time and needs only {@link #wrap(Runnable)} or
+   * {@link #wrap(Callable)}.
+   *
    * @param <T> the result type of the tasks
    * @param tasks the tasks to prepare as they are taken out; may be
    *              {@code null}
    * @return a view of {@code tasks} preparing each task as it is reached, or
    *         {@code null} when {@code tasks} is {@code null}
    */
-  public static <T> Collection<Callable<T>> wrapEach(
+  static <T> Collection<Callable<T>> wrapEach(
       Collection<? extends Callable<T>> tasks) {
     if (tasks == null) {
       return null;

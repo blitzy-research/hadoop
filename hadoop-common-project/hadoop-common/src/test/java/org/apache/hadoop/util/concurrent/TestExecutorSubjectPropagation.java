@@ -53,6 +53,7 @@ import java.util.concurrent.SynchronousQueue;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -2352,6 +2353,189 @@ public class TestExecutorSubjectPropagation {
   }
 
   /**
+   * A submission for one result that runs out of time lets go of the identities
+   * of the tasks it gave up on.
+   * <p>
+   * A submission for one result is run through a completion service, which hands
+   * the pool a future of its own making so that the first task to finish can be
+   * recognised. It is that future which reaches the queue prepared with the
+   * submitter's identity, while the futures such a submission cancels when it
+   * ends are the ones the pool made -- a different set of objects. Cancelling
+   * those therefore says nothing to the queue, and because nothing ever cancels
+   * the entries the queue is holding, a sweep does not recognise them either. On
+   * a pool with nothing free to run them, they would hold the submitter's
+   * subject, and the credentials in it, for as long as they stayed there.
+   * <p>
+   * The queue is watched as the submission fills it, because an empty queue
+   * afterwards says something only if the identities were on it to begin with.
+   * The watch also shows that neither of the other two releases could have been
+   * what reclaimed them: every entry seen waiting was the prepared form that
+   * holds an identity, and none of them was a cancelled future that a sweep
+   * would have taken.
+   *
+   * @throws Exception if a wait times out
+   */
+  @Test
+  @Timeout(value = 60)
+  public void testSubmissionForOneResultOutOfTimeLetsGoOfItsIdentities()
+      throws Exception {
+    Subject submitter = newSubject("any-cancel-release@EXAMPLE.COM");
+    final ThreadPoolExecutor pool = registerPool("any-cancel-release");
+    final WatchedTasks tasks = new WatchedTasks(instantTasks(4), pool);
+    final AtomicReference<Exception> ending = new AtomicReference<>();
+
+    occupyTheWorker(submitter, pool);
+    SubjectUtil.doAs(submitter, new PrivilegedAction<Void>() {
+      @Override
+      public Void run() {
+        try {
+          pool.invokeAny(tasks, SHORT_WAIT_MILLIS, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+          ending.set(e);
+        } catch (Exception e) {
+          ending.set(e);
+        }
+        return (Void) null;
+      }
+    });
+
+    assertNotNull(ending.get(),
+        "the submission for one result was expected to run out of time, which "
+            + "is what makes this a test of the tasks it gives up on");
+    assertEquals(TimeoutException.class, ending.get().getClass(),
+        "the submission for one result ended in an unexpected way: "
+            + ending.get());
+    assertEquals(tasks.size() - 1, tasks.mostSeenWaiting(),
+        "the tasks of the submission did not end up waiting on the queue");
+    assertEquals(tasks.mostSeenWaiting(), tasks.mostSeenPrepared(),
+        "a task waiting on the queue was not the prepared form that holds its "
+            + "submitter's identity, so this assertion would not be watching "
+            + "that identity being let go of");
+    assertEquals(0, tasks.mostSeenSweepable(),
+        "an entry waiting on the queue stood for a cancelled future, so a "
+            + "sweep could have been what reclaimed it and this assertion "
+            + "would not be reading the submission's own release");
+    assertEquals(0, pool.getQueue().size(),
+        "the tasks a submission for one result gave up on were left occupying "
+            + "the queue, so the identity of the caller that made it stayed "
+            + "reachable through every one of them");
+  }
+
+  /**
+   * A submission for one result lets go of the identities of the tasks it did
+   * not need, once one of them has produced its result.
+   * <p>
+   * Winning is the ordinary ending for such a submission, and it abandons every
+   * other task exactly as running out of time does. This pool has one worker,
+   * which is busy, and room for two waiting tasks, so the first two tasks wait
+   * while the third is refused and run by the caller itself -- which is what
+   * lets the submission finish with no worker ever becoming free to drain what
+   * it left behind. The release therefore has to come from the submission, and
+   * an empty queue afterwards is what says it did.
+   *
+   * @throws Exception if a wait times out
+   */
+  @Test
+  @Timeout(value = 30)
+  public void testSubmissionForOneResultLetsGoOfTheTasksItDidNotNeed()
+      throws Exception {
+    Subject submitter = newSubject("any-winner-release@EXAMPLE.COM");
+    final ThreadPoolExecutor pool = register(new HadoopThreadPoolExecutor(1, 1,
+        0L, TimeUnit.MILLISECONDS, new LinkedBlockingQueue<Runnable>(2),
+        new PlainDaemonThreadFactory("any-winner-release"),
+        new ThreadPoolExecutor.CallerRunsPolicy()));
+    final WatchedTasks tasks = new WatchedTasks(instantTasks(3), pool);
+    final AtomicReference<String> result = new AtomicReference<>();
+
+    occupyTheWorker(submitter, pool);
+    SubjectUtil.doAs(submitter, new PrivilegedAction<Void>() {
+      @Override
+      public Void run() {
+        try {
+          result.set(pool.invokeAny(tasks));
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+        } catch (ExecutionException e) {
+          throw new IllegalStateException("no task completed", e);
+        }
+        return (Void) null;
+      }
+    });
+
+    assertEquals(SENTINEL, result.get(),
+        "the submission for one result did not return the result of a task "
+            + "that completed");
+    assertEquals(tasks.size() - 1, tasks.mostSeenWaiting(),
+        "the tasks the submission did not need never waited on the queue, so "
+            + "this assertion would not be watching them being let go of");
+    assertEquals(tasks.mostSeenWaiting(), tasks.mostSeenPrepared(),
+        "a task waiting on the queue was not the prepared form that holds its "
+            + "submitter's identity");
+    assertEquals(0, tasks.mostSeenSweepable(),
+        "an entry waiting on the queue stood for a cancelled future, so a "
+            + "sweep could have been what reclaimed it");
+    assertEquals(0, pool.getQueue().size(),
+        "the tasks a submission for one result did not need were left "
+            + "occupying the queue, so the identity of the caller that made it "
+            + "stayed reachable through every one of them");
+  }
+
+  /**
+   * A scheduled pool lets go of the identities of the tasks a submission for one
+   * result gave up on, on the same terms as a plain pool.
+   * <p>
+   * The queue of a scheduled pool holds an entry of the pool's own making which
+   * carries the prepared task rather than being it, so the identity is reachable
+   * one step further in. That entry is not cancelled when the submission ends
+   * either -- the submission cancels only the futures it was handed back -- so
+   * neither cancellation nor a sweep reclaims it, and an empty queue is what
+   * says the submission itself did.
+   *
+   * @throws Exception if a wait times out
+   */
+  @Test
+  @Timeout(value = 60)
+  public void testScheduledSubmissionForOneResultLetsGoOfItsIdentities()
+      throws Exception {
+    Subject submitter = newSubject("scheduled-any-release@EXAMPLE.COM");
+    final ThreadPoolExecutor pool =
+        register(new HadoopScheduledThreadPoolExecutor(1,
+            new PlainDaemonThreadFactory("scheduled-any-release")));
+    final WatchedTasks tasks = new WatchedTasks(instantTasks(4), pool);
+    final AtomicReference<Exception> ending = new AtomicReference<>();
+
+    occupyTheWorker(submitter, pool);
+    SubjectUtil.doAs(submitter, new PrivilegedAction<Void>() {
+      @Override
+      public Void run() {
+        try {
+          pool.invokeAny(tasks, SHORT_WAIT_MILLIS, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+          ending.set(e);
+        } catch (Exception e) {
+          ending.set(e);
+        }
+        return (Void) null;
+      }
+    });
+
+    assertEquals(TimeoutException.class, ending.get().getClass(),
+        "the submission for one result ended in an unexpected way: "
+            + ending.get());
+    assertEquals(tasks.size() - 1, tasks.mostSeenWaiting(),
+        "the tasks of the submission did not end up waiting on the queue");
+    assertEquals(0, tasks.mostSeenSweepable(),
+        "an entry waiting on the queue was a cancelled future, so a sweep "
+            + "could have been what reclaimed it");
+    assertEquals(0, pool.getQueue().size(),
+        "the tasks a submission for one result gave up on were left occupying "
+            + "the queue of a scheduled pool, so the identity of the caller "
+            + "that made it stayed reachable through every one of them");
+  }
+
+  /**
    * Sweeping the queue still drops cancelled tasks that this pool did not make
    * the futures for.
    * <p>
@@ -2588,6 +2772,29 @@ public class TestExecutorSubjectPropagation {
     return register(new HadoopThreadPoolExecutor(1, 1, 0L,
         TimeUnit.MILLISECONDS, new LinkedBlockingQueue<Runnable>(),
         new PlainDaemonThreadFactory(prefix)));
+  }
+
+  /**
+   * Returns tasks that each complete at once with the sentinel result.
+   * <p>
+   * A submission for one result needs more than one task before it has anything
+   * to give up on, and needs them to be alike so that which of them wins makes
+   * no difference to what is being asserted.
+   *
+   * @param count how many tasks to return
+   * @return that many tasks, each returning {@link #SENTINEL}
+   */
+  private static List<Callable<String>> instantTasks(int count) {
+    List<Callable<String>> tasks = new ArrayList<>();
+    for (int i = 0; i < count; i++) {
+      tasks.add(new Callable<String>() {
+        @Override
+        public String call() {
+          return SENTINEL;
+        }
+      });
+    }
+    return tasks;
   }
 
   /**
@@ -3001,6 +3208,108 @@ public class TestExecutorSubjectPropagation {
     @Override
     public int size() {
       return tasks.size();
+    }
+  }
+
+  /**
+   * A collection of tasks that looks at a pool's queue as each task is yielded.
+   * <p>
+   * A submission reads the collection it was given on the thread that made it,
+   * one task at a time, and hands each task to the pool before asking for the
+   * next one. Looking at the queue from inside that reading is therefore the one
+   * moment at which the entries the submission is putting there can be seen at
+   * all: by the time it returns they are meant to be gone, and an assertion that
+   * they are gone says nothing unless they were once there.
+   * <p>
+   * Three things about what is waiting are worth recording. How many entries
+   * there are says the tasks reached the queue. How many of them are the prepared
+   * form -- an entry that is not what unwrapping it gives back -- says those
+   * entries hold an identity. How many of them stand for a future that has
+   * already been cancelled says whether a sweep of the queue could have been what
+   * reclaimed them, which has to be none of them for the release being asserted
+   * to be the submission's own.
+   * <p>
+   * Every look is taken on the thread that makes the submission, and every read
+   * of what was seen happens after that submission has returned to it, so plain
+   * fields hold this safely.
+   */
+  private static final class WatchedTasks
+      extends AbstractCollection<Callable<String>> {
+
+    private final List<Callable<String>> tasks;
+    private final ThreadPoolExecutor pool;
+    private int mostWaiting;
+    private int mostPrepared;
+    private int mostSweepable;
+
+    WatchedTasks(List<Callable<String>> tasks, ThreadPoolExecutor pool) {
+      this.tasks = tasks;
+      this.pool = pool;
+    }
+
+    @Override
+    public Iterator<Callable<String>> iterator() {
+      final Iterator<Callable<String>> source = tasks.iterator();
+      return new Iterator<Callable<String>>() {
+        @Override
+        public boolean hasNext() {
+          return source.hasNext();
+        }
+
+        @Override
+        public Callable<String> next() {
+          look();
+          return source.next();
+        }
+      };
+    }
+
+    @Override
+    public int size() {
+      return tasks.size();
+    }
+
+    /**
+     * Records what the pool's queue is holding at this moment.
+     */
+    private void look() {
+      int waiting = 0;
+      int prepared = 0;
+      int sweepable = 0;
+      for (Runnable queued : pool.getQueue()) {
+        waiting++;
+        Runnable task = SubjectPreservingTasks.unwrap(queued);
+        if (task != queued) {
+          prepared++;
+        }
+        if (task instanceof Future<?> && ((Future<?>) task).isCancelled()) {
+          sweepable++;
+        }
+      }
+      mostWaiting = Math.max(mostWaiting, waiting);
+      mostPrepared = Math.max(mostPrepared, prepared);
+      mostSweepable = Math.max(mostSweepable, sweepable);
+    }
+
+    /**
+     * @return the most entries seen waiting on the queue at one time
+     */
+    int mostSeenWaiting() {
+      return mostWaiting;
+    }
+
+    /**
+     * @return the most entries seen waiting in prepared form at one time
+     */
+    int mostSeenPrepared() {
+      return mostPrepared;
+    }
+
+    /**
+     * @return the most entries seen waiting that a sweep would have reclaimed
+     */
+    int mostSeenSweepable() {
+      return mostSweepable;
     }
   }
 
