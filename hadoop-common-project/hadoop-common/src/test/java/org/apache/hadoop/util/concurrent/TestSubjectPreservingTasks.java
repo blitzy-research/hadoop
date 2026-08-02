@@ -34,7 +34,6 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
-import java.util.concurrent.FutureTask;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ThreadFactory;
@@ -535,8 +534,11 @@ public class TestSubjectPreservingTasks {
    * while the task they are handed is still the one holding the result. Were the
    * identity-carrying layer left on, that check would find nothing to ask, every
    * such failure would go unreported, and nothing would fail to say so: the line
-   * written after the task ran would also name the wrong type. Both are asserted
-   * here, along with the failure reaching the caller unchanged.
+   * written after the task ran would also name that layer instead of the task.
+   * Both are asserted here, along with the failure reaching the caller
+   * unchanged. The task the pool was handed is the future its submitter holds,
+   * so that future's own type is what the line has to name, whichever type of
+   * future the pool makes for a submission.
    *
    * @throws Exception if a wait times out
    */
@@ -583,9 +585,13 @@ public class TestSubjectPreservingTasks {
     assertTrue(reported.contains("Caught exception in thread"),
         "the failure was not reported as one caught in a pool thread: "
             + reported);
-    assertEquals(FutureTask.class.getName(), loggedRunnableType(reported),
+    assertFalse(reported.contains(WRAPPER_NAME),
+        "the line written after a task ran named what carries an identity "
+            + "rather than the task the pool was given: " + reported);
+    assertEquals(submitted.get().getClass().getName(),
+        loggedRunnableType(reported),
         "the line written after a task ran did not name the task the pool was "
-            + "given");
+            + "given, which is the future its submitter holds");
   }
 
   /**

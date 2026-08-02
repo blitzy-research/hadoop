@@ -20,6 +20,8 @@ package org.apache.hadoop.util.concurrent;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
@@ -28,6 +30,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.IOException;
 import java.security.PrivilegedAction;
+import java.security.PrivilegedExceptionAction;
 import java.util.AbstractCollection;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -41,6 +44,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
+import java.util.concurrent.FutureTask;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
@@ -56,14 +60,17 @@ import java.util.concurrent.atomic.AtomicReference;
 import javax.security.auth.Subject;
 import javax.security.auth.kerberos.KerberosPrincipal;
 
+import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.crypto.key.kms.ValueQueue;
 import org.apache.hadoop.crypto.key.kms.ValueQueue.SyncGenerationPolicy;
 import org.apache.hadoop.thirdparty.com.google.common.util.concurrent.MoreExecutors;
+import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.hadoop.security.authentication.util.SubjectUtil;
 import org.apache.hadoop.util.BlockingThreadPoolExecutorService;
 import org.apache.hadoop.util.Daemon;
 import org.apache.hadoop.util.SemaphoredDelegatingExecutor;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.function.Executable;
@@ -103,6 +110,20 @@ import org.junit.jupiter.api.function.Executable;
  * that two distinct identities can never satisfy an assertion meant for one of
  * them. Every observation crosses a thread boundary through a future or a
  * latch, and every executor these tests create is shut down afterwards.
+ * <p>
+ * A subject observed is necessary but not sufficient, so every boundary is
+ * covered a second time through {@link UserGroupInformation}, which is the
+ * interface production code authorizes and audits against. That second reading
+ * matters because {@link UserGroupInformation#getCurrentUser()} falls back to
+ * whoever the process logged in as whenever it finds no subject: a task that lost
+ * its submitter's identity outright would still report a perfectly valid user,
+ * and the work would be authorized and recorded against that user instead. These
+ * tests therefore install a login user of their own that no task is ever
+ * submitted by, and require every observed user to be exactly the submitting one
+ * and not that login, so the fall back is a failure rather than a silent pass.
+ * The identities are told apart by identity as well as by name, which
+ * {@link UserGroupInformation#equals(Object)} makes exact by comparing the
+ * subjects behind them by reference.
  */
 public class TestExecutorSubjectPropagation {
 
@@ -145,6 +166,20 @@ public class TestExecutorSubjectPropagation {
   private static final String REJECTED_TASK_NAME = "the-task-that-was-refused";
 
   /**
+   * The name of the user the process is taken to have logged in as.
+   * <p>
+   * No task here is ever submitted by this user, so a task observing it can only
+   * mean that its submitter's identity failed to reach it and
+   * {@link UserGroupInformation#getCurrentUser()} fell back to the login. A task
+   * running as the process login still runs as a perfectly valid user, decides
+   * authorizations under it and is audited under it, so an assertion that merely
+   * required <em>some</em> user would pass while the work ran as the wrong one.
+   * Naming the login user distinctly, and requiring every observed user to differ
+   * from it, is what makes that fall back a failure.
+   */
+  private static final String LOGIN_USER = "sentinel-login-user";
+
+  /**
    * Released when a test ends, freeing any worker a test deliberately tied up.
    * <p>
    * Several assertions here are about a task that is still waiting, which needs
@@ -167,6 +202,30 @@ public class TestExecutorSubjectPropagation {
   private <E extends ExecutorService> E register(E pool) {
     pools.add(pool);
     return pool;
+  }
+
+  /**
+   * Installs a known login user before each test, so that a fall back to it is
+   * recognisable.
+   * <p>
+   * The identity machinery keeps process-wide state, so it is put into a known
+   * state here rather than being taken as found, and the login user is set
+   * explicitly instead of being left to whichever operating-system account
+   * happens to be running the build.
+   */
+  @BeforeEach
+  public void setUpTheLoginUser() {
+    UserGroupInformation.reset();
+    UserGroupInformation.setConfiguration(new Configuration());
+    UserGroupInformation.setLoginUser(
+        UserGroupInformation.createRemoteUser(LOGIN_USER));
+  }
+
+  /** Leaves no logged in user behind for the next test to find. */
+  @AfterEach
+  public void forgetTheLoginUser() {
+    UserGroupInformation.setLoginUser(null);
+    UserGroupInformation.reset();
   }
 
   /**
@@ -2176,31 +2235,37 @@ public class TestExecutorSubjectPropagation {
   }
 
   /**
-   * Cancelled tasks are dropped from the queue, which is what lets go of the
-   * identities they were holding.
+   * Cancelling a task that is still waiting on the queue lets go of the identity
+   * it was holding, without anything else having to be asked for.
    * <p>
-   * A cancelled task says so through the future it was submitted as, and the
-   * queue holds the prepared form of that future rather than the future itself,
-   * which the pool's own sweep does not recognise. Each such task keeps a
-   * reference to its submitter's subject, and to the credentials in it, for as
-   * long as it sits there -- on a queue that has stopped draining, indefinitely.
-   * Reclaiming the room is therefore what releases them, and an empty queue is
-   * what says it happened.
+   * A task prepared for its submitter keeps a reference to that submitter's
+   * subject, and to the credentials in it, for as long as the queue holds the
+   * prepared task. Cancelling the future the task was submitted as ends the work
+   * but says nothing of its own accord to the queue, so a cancelled task would go
+   * on holding its submitter's credentials until something else displaced it --
+   * and on a pool whose workers are all occupied, or whose queue has stopped
+   * draining, nothing else ever does. A caller that has cancelled its work is
+   * owed that release there and then, on the strength of the cancellation alone.
+   * <p>
+   * The queue is checked beforehand to be holding the prepared form rather than
+   * the futures themselves, because that prepared form is the object the identity
+   * is reachable through, and an empty queue afterwards is what says it is no
+   * longer reachable that way. Nothing sweeps the queue in between: the whole
+   * point of the assertion is that no sweep is needed.
    *
    * @throws Exception if a wait times out
    */
   @Test
   @Timeout(value = 30)
-  public void testPurgeDropsCancelledTasksAndReleasesTheirSubjects()
-      throws Exception {
-    Subject submitter = newSubject("purge@EXAMPLE.COM");
-    final ThreadPoolExecutor pool = registerPool("purge");
+  public void testCancellingAQueuedTaskLetsGoOfItsIdentity() throws Exception {
+    Subject submitter = newSubject("cancel-release@EXAMPLE.COM");
+    final ThreadPoolExecutor pool = registerPool("cancel-release");
     final List<Future<?>> cancelled = new ArrayList<>();
 
     occupyTheWorker(submitter, pool);
-    SubjectUtil.callAs(submitter, new Callable<Void>() {
+    SubjectUtil.doAs(submitter, new PrivilegedAction<Void>() {
       @Override
-      public Void call() {
+      public Void run() {
         for (int i = 0; i < 3; i++) {
           cancelled.add(pool.submit(new SubjectRecorder(1)));
         }
@@ -2209,17 +2274,125 @@ public class TestExecutorSubjectPropagation {
     });
     assertEquals(3, pool.getQueue().size(),
         "the tasks did not end up waiting on the queue");
+    for (Runnable queued : pool.getQueue()) {
+      assertNotSame(queued, SubjectPreservingTasks.unwrap(queued),
+          "a task waiting on the queue was not the prepared form that holds "
+              + "its submitter's identity, so this assertion would not be "
+              + "watching that identity being let go of");
+    }
+
     for (Future<?> task : cancelled) {
       assertTrue(task.cancel(false), "a queued task refused to be cancelled");
     }
+
+    assertEquals(0, pool.getQueue().size(),
+        "cancelling a queued task left it occupying the queue, so the identity "
+            + "it captured stayed reachable until something else displaced it");
+    assertTrue(pool.shutdownNow().isEmpty(),
+        "the pool was still holding work that had already been cancelled");
+  }
+
+  /**
+   * A bulk submission that runs out of time lets go of the identities of the
+   * tasks it gave up on.
+   * <p>
+   * A timed bulk submission hands every one of its tasks over and then cancels
+   * whichever of them its wait did not cover, so a submission made to a pool with
+   * nothing free to run it ends with a queue full of cancelled work. Each of
+   * those tasks was prepared for the submitter of the bulk call, so every one of
+   * them holds that identity, and a caller whose wait has expired has no further
+   * call to make on which to release them.
+   *
+   * @throws Exception if a wait times out
+   */
+  @Test
+  @Timeout(value = 60)
+  public void testBulkSubmissionOutOfTimeLetsGoOfItsIdentities()
+      throws Exception {
+    Subject submitter = newSubject("bulk-cancel-release@EXAMPLE.COM");
+    final ThreadPoolExecutor pool = registerPool("bulk-cancel-release");
+    final List<Callable<String>> tasks = new ArrayList<>();
+    for (int i = 0; i < 3; i++) {
+      tasks.add(new Callable<String>() {
+        @Override
+        public String call() {
+          return SENTINEL;
+        }
+      });
+    }
+    final AtomicReference<List<Future<String>>> results =
+        new AtomicReference<>();
+
+    occupyTheWorker(submitter, pool);
+    SubjectUtil.doAs(submitter, new PrivilegedAction<Void>() {
+      @Override
+      public Void run() {
+        try {
+          results.set(pool.invokeAll(tasks, SHORT_WAIT_MILLIS,
+              TimeUnit.MILLISECONDS));
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+        }
+        return (Void) null;
+      }
+    });
+
+    assertEquals(tasks.size(), results.get().size(),
+        "the bulk submission did not return a result for every task it was "
+            + "given");
+    for (Future<String> result : results.get()) {
+      assertTrue(result.isCancelled(),
+          "a task the bulk submission had no time left for was not cancelled, "
+              + "so this assertion would not be watching a cancelled task");
+    }
+    assertEquals(0, pool.getQueue().size(),
+        "the tasks a bulk submission gave up on were left occupying the queue, "
+            + "so the identity of the caller that made it stayed reachable "
+            + "through every one of them");
+  }
+
+  /**
+   * Sweeping the queue still drops cancelled tasks that this pool did not make
+   * the futures for.
+   * <p>
+   * A caller may make its own future and hand it over to be run as a plain task,
+   * in which case this pool has no say in how that future reports being cancelled
+   * and cannot be told of it. Such a task is prepared for its submitter like any
+   * other, so it holds an identity while it waits, and a sweep is what reclaims
+   * it. That is the whole of what the sweep is now for; the tasks this pool makes
+   * the futures for no longer need it.
+   *
+   * @throws Exception if a wait times out
+   */
+  @Test
+  @Timeout(value = 30)
+  public void testSweepDropsCancelledTasksThePoolDidNotMake() throws Exception {
+    Subject submitter = newSubject("purge@EXAMPLE.COM");
+    final ThreadPoolExecutor pool = registerPool("purge");
+    final List<FutureTask<Void>> foreign = new ArrayList<>();
+
+    occupyTheWorker(submitter, pool);
+    for (int i = 0; i < 3; i++) {
+      FutureTask<Void> task =
+          new FutureTask<Void>(new SubjectRecorder(1), (Void) null);
+      foreign.add(task);
+      submitFromScope(submitter, pool, task);
+    }
     assertEquals(3, pool.getQueue().size(),
-        "cancelling alone was expected to leave the queue occupied");
+        "the tasks did not end up waiting on the queue");
+    for (FutureTask<Void> task : foreign) {
+      assertTrue(task.cancel(false), "a queued task refused to be cancelled");
+    }
+    assertEquals(3, pool.getQueue().size(),
+        "a cancelled future the pool did not make was expected to wait for a "
+            + "sweep, which is what makes this a test of the sweep");
 
     pool.purge();
 
     assertEquals(0, pool.getQueue().size(),
-        "cancelled tasks were left occupying the queue, so the subjects they "
-            + "captured were never released");
+        "cancelled tasks the pool did not make the futures for were left "
+            + "occupying the queue, so the identities they captured were never "
+            + "released");
   }
 
   /**
@@ -2965,6 +3138,606 @@ public class TestExecutorSubjectPropagation {
      */
     Subject subjectOnFillerThread() {
       return onFillerThread.get();
+    }
+  }
+
+  /**
+   * Every factory hands its pool's tasks the user that submitted them.
+   * <p>
+   * A Subject observed is necessary but not sufficient: production code decides
+   * authorizations and writes audit records through
+   * {@link UserGroupInformation#getCurrentUser()}, which falls back to the
+   * process login whenever it finds no Subject. Each factory is therefore read
+   * through a user of its own, and each observed user is required to be exactly
+   * that user and not the login, so a task that lost its submitter's identity
+   * fails here instead of quietly running as somebody else.
+   *
+   * @throws Exception if a task fails or a wait times out
+   */
+  @Test
+  @Timeout(value = 30)
+  public void testEveryFactoryServesTheSubmittingUser() throws Exception {
+    assertRanAs(userNamed("cached-user"),
+        register(HadoopExecutors.newCachedThreadPool(
+            new PlainDaemonThreadFactory("ugi-cached"))),
+        "a cached pool");
+    assertRanAs(userNamed("fixed-user"),
+        register(HadoopExecutors.newFixedThreadPool(1,
+            new PlainDaemonThreadFactory("ugi-fixed"))),
+        "a fixed pool");
+    assertRanAs(userNamed("single-user"),
+        register(HadoopExecutors.newSingleThreadExecutor(
+            new PlainDaemonThreadFactory("ugi-single"))),
+        "the forwarding single-thread service");
+    assertRanAs(userNamed("scheduled-user"),
+        register(HadoopExecutors.newScheduledThreadPool(1,
+            new PlainDaemonThreadFactory("ugi-scheduled"))),
+        "a scheduled pool");
+    assertRanAs(userNamed("single-scheduled-user"),
+        register(HadoopExecutors.newSingleThreadScheduledExecutor(
+            new PlainDaemonThreadFactory("ugi-single-scheduled"))),
+        "the forwarding single-thread scheduled service");
+  }
+
+  /**
+   * Hadoop's own pool hands its tasks the submitting user however the work was
+   * given to it.
+   * <p>
+   * The three ways of handing work over reach the queue by different routes: one
+   * arrives as it was given, one is wrapped in a future the pool makes for it,
+   * and one arrives as a whole collection whose tasks the pool takes at its own
+   * pace. A user reaching the first says nothing about the other two, so each is
+   * read under a user of its own.
+   *
+   * @throws Exception if a task fails or a wait times out
+   */
+  @Test
+  @Timeout(value = 30)
+  public void testHadoopPoolServesTheSubmittingUserOnEveryPath()
+      throws Exception {
+    final ThreadPoolExecutor pool = register(new HadoopThreadPoolExecutor(1, 1,
+        0L, TimeUnit.MILLISECONDS, new LinkedBlockingQueue<Runnable>(),
+        new PlainDaemonThreadFactory("ugi-paths")));
+
+    final UserGroupInformation directly = userNamed("execute-user");
+    final IdentityRecorder recorder = new IdentityRecorder(1);
+    Subject onSubmittingThread = submitAs(directly, new Submission() {
+      @Override
+      public void submitTo() {
+        pool.execute(recorder);
+      }
+    });
+    assertTrue(recorder.awaitRuns(),
+        "the task handed over directly never ran");
+    assertRanAs(directly, onSubmittingThread, recorder.observed().get(0),
+        "a task handed over directly");
+
+    assertRanAs(userNamed("submit-user"), pool, "a task submitted for its result");
+
+    final UserGroupInformation inBulk = userNamed("bulk-user");
+    final List<Callable<TaskIdentity>> tasks = new ArrayList<>();
+    tasks.add(taskIdentity());
+    tasks.add(taskIdentity());
+    final AtomicReference<List<Future<TaskIdentity>>> results =
+        new AtomicReference<>();
+    Subject inBulkSubject = submitAs(inBulk, new Submission() {
+      @Override
+      public void submitTo() throws Exception {
+        results.set(pool.invokeAll(tasks));
+      }
+    });
+    for (Future<TaskIdentity> result : results.get()) {
+      assertRanAs(inBulk, inBulkSubject,
+          result.get(TIMEOUT_SECONDS, TimeUnit.SECONDS),
+          "a task submitted in bulk");
+    }
+  }
+
+  /**
+   * A scheduled pool hands every run of a task the user that scheduled it.
+   * <p>
+   * A task that repeats runs long after the call that scheduled it returned, and
+   * each of its runs is owed the scheduling user just as the first is. Reading
+   * only the first run would leave a pool that served the right user once and
+   * the login user afterwards indistinguishable from a correct one, so every run
+   * observed is asserted.
+   *
+   * @throws Exception if a task fails or a wait times out
+   */
+  @Test
+  @Timeout(value = 30)
+  public void testScheduledPoolServesTheSchedulingUserOnEveryRun()
+      throws Exception {
+    final HadoopScheduledThreadPoolExecutor pool =
+        register(new HadoopScheduledThreadPoolExecutor(1,
+            new PlainDaemonThreadFactory("ugi-periodic")));
+    final UserGroupInformation scheduler = userNamed("periodic-user");
+    final IdentityRecorder recorder = new IdentityRecorder(3);
+    final AtomicReference<ScheduledFuture<?>> repeating = new AtomicReference<>();
+
+    Subject onSchedulingThread = submitAs(scheduler, new Submission() {
+      @Override
+      public void submitTo() {
+        repeating.set(pool.scheduleAtFixedRate(recorder, 0, PERIOD_MILLIS,
+            TimeUnit.MILLISECONDS));
+      }
+    });
+    assertTrue(recorder.awaitRuns(),
+        "the repeating task did not run as often as was expected of it");
+    repeating.get().cancel(false);
+
+    List<TaskIdentity> runs = recorder.observed();
+    assertTrue(runs.size() >= 3,
+        "the repeating task was expected to have run at least three times");
+    for (TaskIdentity run : runs) {
+      assertRanAs(scheduler, onSchedulingThread, run,
+          "a run of a task repeating at a fixed rate");
+    }
+  }
+
+  /**
+   * A scheduled pool hands the scheduling user's identity to every kind of
+   * schedule it accepts.
+   * <p>
+   * The four ways of scheduling work are separate entry points, and a pool that
+   * served one of them correctly could still lose the identity on another, so
+   * each is read under a user of its own. Asking for a result rather than
+   * scheduling covers the fourth, and is asserted where the factories are.
+   *
+   * @throws Exception if a task fails or a wait times out
+   */
+  @Test
+  @Timeout(value = 30)
+  public void testScheduledPoolServesTheSchedulingUserOnEveryScheduleKind()
+      throws Exception {
+    final HadoopScheduledThreadPoolExecutor pool =
+        register(new HadoopScheduledThreadPoolExecutor(1,
+            new PlainDaemonThreadFactory("ugi-schedules")));
+
+    final UserGroupInformation once = userNamed("scheduled-once-user");
+    final IdentityRecorder onceOnly = new IdentityRecorder(1);
+    Subject onceSubject = submitAs(once, new Submission() {
+      @Override
+      public void submitTo() {
+        pool.schedule(onceOnly, 0, TimeUnit.MILLISECONDS);
+      }
+    });
+    assertTrue(onceOnly.awaitRuns(), "the task scheduled once never ran");
+    assertRanAs(once, onceSubject, onceOnly.observed().get(0),
+        "a task scheduled to run once");
+
+    final UserGroupInformation delayed = userNamed("scheduled-delay-user");
+    final IdentityRecorder repeatedly = new IdentityRecorder(3);
+    final AtomicReference<ScheduledFuture<?>> repeating = new AtomicReference<>();
+    Subject delayedSubject = submitAs(delayed, new Submission() {
+      @Override
+      public void submitTo() {
+        repeating.set(pool.scheduleWithFixedDelay(repeatedly, 0, PERIOD_MILLIS,
+            TimeUnit.MILLISECONDS));
+      }
+    });
+    assertTrue(repeatedly.awaitRuns(),
+        "the task repeating at a fixed delay did not run as often as was "
+            + "expected of it");
+    repeating.get().cancel(false);
+    List<TaskIdentity> runs = repeatedly.observed();
+    assertTrue(runs.size() >= 3,
+        "the repeating task was expected to have run at least three times");
+    for (TaskIdentity run : runs) {
+      assertRanAs(delayed, delayedSubject, run,
+          "a run of a task repeating at a fixed delay");
+    }
+  }
+
+  /**
+   * The executors that bound how much work is outstanding hand their tasks the
+   * submitting user too, including where one of them forwards to another.
+   * <p>
+   * These add decoration of their own to every task they forward, and the nested
+   * arrangement puts a task through two such layers, which is the composition the
+   * object-store filesystems build. Each layer is read under a user of its own,
+   * because a user surviving one layer says nothing about surviving two.
+   *
+   * @throws Exception if a task fails or a wait times out
+   */
+  @Test
+  @Timeout(value = 30)
+  public void testBoundedExecutorsServeTheSubmittingUser() throws Exception {
+    assertRanAs(userNamed("semaphored-user"), newSemaphored("ugi"),
+        "a semaphored executor");
+    assertRanAs(userNamed("blocking-user"), newBlocking("ugi"),
+        "a blocking pool");
+    assertRanAs(userNamed("nested-bounded-user"),
+        newSemaphoredOverBlocking("ugi"),
+        "a semaphored executor over a blocking pool");
+  }
+
+  /**
+   * One worker serving two users in turn runs the second user's task as that
+   * second user.
+   * <p>
+   * This is the case a pool gets wrong by reading an identity once, when its
+   * worker was created, rather than at every submission: the second user's task
+   * then runs as the first, decides authorizations as the first and is audited as
+   * the first, and nothing reports it. Both submissions go into the same
+   * one-worker pool and the worker is proved to have been kept across them, so a
+   * task running as the wrong user has nowhere to hide.
+   *
+   * @throws Exception if a task fails or a wait times out
+   */
+  @Test
+  @Timeout(value = 30)
+  public void testRetainedWorkerServesTheSecondSubmittingUser()
+      throws Exception {
+    ExecutorService pool = register(HadoopExecutors.newFixedThreadPool(1,
+        new PlainDaemonThreadFactory("ugi-retained")));
+    UserGroupInformation first = userNamed("retained-first-user");
+    UserGroupInformation second = userNamed("retained-second-user");
+
+    UserObservation earlier = observeUnderUser(first, pool);
+    UserObservation later = observeUnderUser(second, pool);
+
+    assertSame(earlier.inTask().worker(), later.inTask().worker(),
+        "the pool replaced its worker between the two submissions, so this "
+            + "assertion never reached the case it is about");
+    assertRanAs(first, earlier.onSubmittingThread(), earlier.inTask(),
+        "the submission that caused the worker to exist");
+    assertRanAs(second, later.onSubmittingThread(), later.inTask(),
+        "a submission made by a second user to a worker an earlier user "
+            + "created");
+    assertNotEquals(first, later.inTask().user(),
+        "a task run by a worker an earlier user created ran as that earlier "
+            + "user");
+  }
+
+  /**
+   * A submission made with no user in force runs as the process login, on a
+   * worker two other users have already used.
+   * <p>
+   * This is what makes every assertion above mean something. It establishes that
+   * the login user really is what a task observes when no identity was
+   * established, so a task observing its submitter instead observed something
+   * that had to be carried there; and it establishes that such a task does not
+   * pick up the identity of whichever user the worker served last, which is the
+   * failure that would let one caller's work run as another user entirely.
+   *
+   * @throws Exception if a task fails or a wait times out
+   */
+  @Test
+  @Timeout(value = 30)
+  public void testRetainedWorkerServesTheLoginUserToAUserlessSubmission()
+      throws Exception {
+    ExecutorService pool = register(HadoopExecutors.newFixedThreadPool(1,
+        new PlainDaemonThreadFactory("ugi-userless")));
+    UserGroupInformation earlier = userNamed("userless-earlier-user");
+
+    UserObservation served = observeUnderUser(earlier, pool);
+    assertRanAs(earlier, served.onSubmittingThread(), served.inTask(),
+        "the submission that caused the worker to exist");
+
+    assertNull(SubjectUtil.current(),
+        "a Subject was already in force on this thread, so the submission "
+            + "below would not be one made with no user");
+    TaskIdentity withoutAUser =
+        pool.submit(taskIdentity()).get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+
+    assertSame(served.inTask().worker(), withoutAUser.worker(),
+        "the pool replaced its worker between the two submissions, so this "
+            + "assertion never reached the case it is about");
+    assertNull(withoutAUser.subject(),
+        "a submission made with no user in force observed a Subject");
+    assertNotNull(withoutAUser.user(),
+        "the task never reported the user it was running as");
+    assertEquals(LOGIN_USER, withoutAUser.user().getUserName(),
+        "a submission made with no user in force did not run as the process "
+            + "login");
+    assertNotEquals(earlier, withoutAUser.user(),
+        "a submission made with no user in force ran as the user whose "
+            + "submission created the worker");
+  }
+
+  /**
+   * Returns a user of the given name, told apart from every other by identity.
+   * <p>
+   * {@link UserGroupInformation#equals(Object)} compares the subject behind a
+   * user by reference, so two users built here are never equal to each other even
+   * where their names match, and an assertion meant for one of them cannot be
+   * satisfied by another.
+   *
+   * @param name the user name
+   * @return a user carrying a subject of its own
+   */
+  private static UserGroupInformation userNamed(String name) {
+    return UserGroupInformation.createRemoteUser(name);
+  }
+
+  /**
+   * Reads the user in force on the calling thread.
+   * <p>
+   * A task cannot always declare a checked exception, and failing to read the
+   * identity at all is a failure of the test rather than an observation, so it is
+   * reported as an unchecked exception and leaves the observation unwritten.
+   *
+   * @return the user in force, which is the login user when no subject is in
+   *         force
+   */
+  private static UserGroupInformation currentUser() {
+    try {
+      return UserGroupInformation.getCurrentUser();
+    } catch (IOException e) {
+      throw new IllegalStateException("the user in force could not be read", e);
+    }
+  }
+
+  /**
+   * Returns a task reporting the subject it ran under, the user it ran as and the
+   * worker that ran it.
+   *
+   * @return a task yielding what it observed of its own identity
+   */
+  private static Callable<TaskIdentity> taskIdentity() {
+    return new Callable<TaskIdentity>() {
+      @Override
+      public TaskIdentity call() {
+        return new TaskIdentity(SubjectUtil.current(), currentUser(),
+            Thread.currentThread());
+      }
+    };
+  }
+
+  /**
+   * Runs {@code submission} inside {@code submitter}'s scope and returns the
+   * subject that was in force there.
+   * <p>
+   * Only the submission happens inside the scope. What the scope held is returned
+   * so that an assertion can require the very same subject inside the task, which
+   * is a stronger statement than requiring an equal one.
+   *
+   * @param submitter the user to submit as
+   * @param submission the submission to make
+   * @return the subject in force on the submitting thread
+   * @throws Exception if the submission fails
+   */
+  private static Subject submitAs(UserGroupInformation submitter,
+      final Submission submission) throws Exception {
+    final AtomicReference<Subject> onSubmittingThread = new AtomicReference<>();
+    submitter.doAs(new PrivilegedExceptionAction<Void>() {
+      @Override
+      public Void run() throws Exception {
+        onSubmittingThread.set(SubjectUtil.current());
+        submission.submitTo();
+        return null;
+      }
+    });
+    return onSubmittingThread.get();
+  }
+
+  /**
+   * Submits a task reporting its own identity to {@code pool} from inside
+   * {@code submitter}'s scope, and returns what was observed on both sides of the
+   * hand-over.
+   *
+   * @param submitter the user to submit as
+   * @param pool the executor to submit to
+   * @return the subject in force on the submitting thread and what the task
+   *         observed
+   * @throws Exception if the task fails or the wait times out
+   */
+  private UserObservation observeUnderUser(UserGroupInformation submitter,
+      final ExecutorService pool) throws Exception {
+    final AtomicReference<Future<TaskIdentity>> submitted =
+        new AtomicReference<>();
+    Subject onSubmittingThread = submitAs(submitter, new Submission() {
+      @Override
+      public void submitTo() {
+        submitted.set(pool.submit(taskIdentity()));
+      }
+    });
+    return new UserObservation(onSubmittingThread,
+        submitted.get().get(TIMEOUT_SECONDS, TimeUnit.SECONDS));
+  }
+
+  /**
+   * Asserts that a task submitted to {@code pool} by {@code submitter} ran as
+   * that user.
+   *
+   * @param submitter the user to submit as
+   * @param pool the executor to submit to
+   * @param boundary what the executor is, for a failure to name
+   * @throws Exception if the task fails or the wait times out
+   */
+  private void assertRanAs(UserGroupInformation submitter, ExecutorService pool,
+      String boundary) throws Exception {
+    UserObservation observed = observeUnderUser(submitter, pool);
+    assertRanAs(submitter, observed.onSubmittingThread(), observed.inTask(),
+        boundary);
+  }
+
+  /**
+   * Asserts that a task ran under exactly the identity that submitted it.
+   * <p>
+   * Four readings are required, and each rules out a different way of appearing
+   * to work. The subject is compared by identity against the one the submitting
+   * thread held, which is the strongest available form and one the machinery can
+   * satisfy, since it re-establishes the very instance. The user is compared as an
+   * identity, which {@link UserGroupInformation#equals(Object)} decides by
+   * comparing subjects by reference, so a second user of the same name cannot
+   * satisfy it. The user's name is compared as well, so that the right subject
+   * carrying the wrong name would still fail. And the name is required to differ
+   * from the login user's, which is what catches an identity that never arrived:
+   * without that reading, a task running as the process login would report a
+   * perfectly valid user and the assertion would pass.
+   *
+   * @param submitter the user that submitted the task
+   * @param onSubmittingThread the subject in force where the task was submitted
+   * @param observed what the task reported of its own identity
+   * @param boundary what the executor is, for a failure to name
+   */
+  private static void assertRanAs(UserGroupInformation submitter,
+      Subject onSubmittingThread, TaskIdentity observed, String boundary) {
+    assertNotNull(onSubmittingThread, boundary + ": the submitting thread held "
+        + "no subject inside its own user's scope, so this assertion would "
+        + "prove nothing");
+    assertNotNull(observed,
+        boundary + ": the task never reported the identity it ran under");
+    assertSame(onSubmittingThread, observed.subject(), boundary + ": the task "
+        + "did not run under the very subject in force on the thread that "
+        + "submitted it");
+    assertNotNull(observed.user(),
+        boundary + ": the task never reported the user it ran as");
+    assertEquals(submitter, observed.user(),
+        boundary + ": the task did not run as the user that submitted it");
+    assertEquals(submitter.getUserName(), observed.user().getUserName(),
+        boundary + ": the task ran as a user of another name");
+    assertNotEquals(LOGIN_USER, observed.user().getUserName(), boundary
+        + ": the task ran as the process login user, so its submitter's "
+        + "identity never reached it");
+  }
+
+  /**
+   * A submission to be made from inside a user's scope.
+   * <p>
+   * The submission methods of an executor differ in what they are given and in
+   * what they hand back, and several of them declare a checked exception, so the
+   * caller supplies the call itself rather than its parts.
+   */
+  private interface Submission {
+
+    /**
+     * Hands work to an executor.
+     *
+     * @throws Exception if the executor refuses the work or the call is
+     *         interrupted
+     */
+    void submitTo() throws Exception;
+  }
+
+  /**
+   * What one task observed of the identity it ran under.
+   */
+  private static final class TaskIdentity {
+
+    /** The subject in force inside the task; {@code null} where there was none. */
+    private final Subject subject;
+
+    /** The user in force inside the task, which is never {@code null}. */
+    private final UserGroupInformation user;
+
+    /** The thread the task ran on. */
+    private final Thread worker;
+
+    TaskIdentity(Subject subject, UserGroupInformation user, Thread worker) {
+      this.subject = subject;
+      this.user = user;
+      this.worker = worker;
+    }
+
+    /**
+     * Returns the subject in force inside the task.
+     *
+     * @return that subject, or {@code null} if there was none
+     */
+    Subject subject() {
+      return subject;
+    }
+
+    /**
+     * Returns the user in force inside the task.
+     *
+     * @return that user, which falls back to the login where no subject was in
+     *         force
+     */
+    UserGroupInformation user() {
+      return user;
+    }
+
+    /**
+     * Returns the worker that ran the task.
+     *
+     * @return the thread the task ran on
+     */
+    Thread worker() {
+      return worker;
+    }
+  }
+
+  /**
+   * What was observed on both sides of a hand-over to an executor.
+   */
+  private static final class UserObservation {
+
+    /** The subject in force on the submitting thread; may be {@code null}. */
+    private final Subject onSubmittingThread;
+
+    /** What the task observed of its own identity. */
+    private final TaskIdentity inTask;
+
+    UserObservation(Subject onSubmittingThread, TaskIdentity inTask) {
+      this.onSubmittingThread = onSubmittingThread;
+      this.inTask = inTask;
+    }
+
+    /**
+     * Returns the subject in force where the task was submitted.
+     *
+     * @return that subject, or {@code null} if there was none
+     */
+    Subject onSubmittingThread() {
+      return onSubmittingThread;
+    }
+
+    /**
+     * Returns what the task observed of its own identity.
+     *
+     * @return the task's own reading
+     */
+    TaskIdentity inTask() {
+      return inTask;
+    }
+  }
+
+  /**
+   * Records the identity of every run of it, once per run.
+   * <p>
+   * A task that repeats has to be asked about all of its runs, so the readings
+   * are kept in a list that tolerates being added to from a worker while being
+   * copied here, and a latch publishes to whoever is waiting that the expected
+   * number of runs has happened.
+   */
+  private static final class IdentityRecorder implements Runnable {
+
+    private final List<TaskIdentity> seen =
+        Collections.synchronizedList(new ArrayList<TaskIdentity>());
+    private final CountDownLatch runs;
+
+    IdentityRecorder(int expectedRuns) {
+      this.runs = new CountDownLatch(expectedRuns);
+    }
+
+    @Override
+    public void run() {
+      seen.add(new TaskIdentity(SubjectUtil.current(), currentUser(),
+          Thread.currentThread()));
+      runs.countDown();
+    }
+
+    /**
+     * Waits for this task to have run as often as was expected of it.
+     *
+     * @return whether it did so before the wait ran out
+     * @throws InterruptedException if this thread is interrupted while waiting
+     */
+    boolean awaitRuns() throws InterruptedException {
+      return runs.await(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+    }
+
+    /**
+     * Returns what each run of this task observed, in order.
+     *
+     * @return a copy of what has been recorded so far
+     */
+    List<TaskIdentity> observed() {
+      return new ArrayList<>(seen);
     }
   }
 }

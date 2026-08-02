@@ -99,6 +99,21 @@ import org.apache.hadoop.security.authentication.util.SubjectUtil;
  * names itself as it always did, so that a rejection message and a log line
  * describe the submitted task rather than the machinery around it.
  * <p>
+ * A prepared task holds the identity it captured, and the credentials in that
+ * identity, for exactly as long as the prepared task itself is reachable, so
+ * bounding one is a matter of bounding the other. The identity is deliberately
+ * not given up once the task has run, because the same prepared task may be run
+ * again: a task scheduled to repeat runs many times, and each of those runs is
+ * owed the identity the schedule was created under. What ends the retention is
+ * therefore the executor letting go of the prepared task -- a worker finishing
+ * with it, the task being removed, or the pool being stopped -- and an executor
+ * that lets a caller cancel work owes it that release without being asked
+ * again. Every executor here obtains it by construction, because the prepared
+ * task is what the cancelled future was given to run and a completed future
+ * lets go of that; a pool that instead prepares a task around a future it was
+ * handed reclaims the queued entry when the future is cancelled, which is what
+ * {@link HadoopThreadPoolExecutor} does.
+ * <p>
  * Wrapping belongs at a single point per executor, so that no call site need
  * know of any of this, and code that inspects a task instead of running it
  * calls {@link #unwrap(Runnable)} first. A method that is handed a whole
@@ -349,6 +364,11 @@ public final class SubjectPreservingTasks {
      * that thread held none and the task is bound for a worker that may hold one
      * of its own. Establishing a {@code null} subject leaves the delegate with no
      * identity, which is what such a task is owed.
+     * <p>
+     * The reference lasts as long as this task is reachable and is never given up
+     * earlier, because a task that repeats is owed the same identity on every
+     * run. Bounding how long it lasts is therefore the business of whatever holds
+     * the task, as the documentation of this class describes.
      */
     private final Subject subject;
 
@@ -402,7 +422,8 @@ public final class SubjectPreservingTasks {
     /**
      * The subject captured on the submitting thread, {@code null} when that
      * thread held none and the task is bound for a worker that may hold one of
-     * its own, exactly as in {@link SubjectPreservingRunnable}.
+     * its own, exactly as in {@link SubjectPreservingRunnable} -- and lasting
+     * exactly as long, for the same reason.
      */
     private final Subject subject;
 

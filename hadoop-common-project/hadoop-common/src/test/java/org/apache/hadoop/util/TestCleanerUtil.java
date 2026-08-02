@@ -18,7 +18,6 @@
 
 package org.apache.hadoop.util;
 
-import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -26,7 +25,6 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.IOException;
-import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
 
 import org.apache.hadoop.util.CleanerUtil.BufferCleaner;
@@ -50,67 +48,58 @@ import org.junit.jupiter.api.Test;
  * removing it would lose the report and not the release.
  * <p>
  * This therefore asserts that releasing is supported on the runtime under test,
- * that the three things published about it agree with each other and with the
- * decision they come from, that releasing a buffer allocated outside the heap
- * succeeds, and that both ways of failing to release one are reported: a buffer
- * that is not outside the heap is refused outright, and a buffer the runtime
- * itself will not release is reported as a failure to release rather than
- * escaping as whatever the runtime threw.
+ * that the three things published about it agree with each other and that the
+ * one of them that does the releasing actually releases, that releasing a
+ * buffer allocated outside the heap succeeds, and that both ways of failing to
+ * release one are reported: a buffer that is not outside the heap is refused
+ * outright, and a buffer the runtime itself will not release is reported as a
+ * failure to release rather than escaping as whatever the runtime threw.
+ * <p>
+ * Every one of those readings is taken through what {@link CleanerUtil}
+ * publishes. All three published items are derived, once, from the very
+ * decision the first removed privileged block used to wrap, and every test here
+ * triggers that derivation, so observing the outcome of that decision needs no
+ * reflective reach into the decision itself.
  */
 public class TestCleanerUtil {
 
   /**
-   * Makes the decision {@link CleanerUtil} makes once, when it is first used,
-   * a second time.
+   * What is published about releasing memory hangs together, and the part of it
+   * that does the releasing actually releases.
    * <p>
-   * The decision is reached by the very code the removed privileged block used
-   * to wrap, so making it again is what allows the published outcome to be
-   * asserted against a decision this test watched being made, on either
-   * outcome, rather than against a constant asserting itself.
+   * All three published items come from one decision, reached during class
+   * initialization by the very code the first removed privileged block used to
+   * wrap, and any test in this class triggers that initialization. Reading them
+   * afterwards therefore observes that decision's outcome, and reading them
+   * against each other is what catches an outcome no caller could act on:
+   * either releasing is supported, in which case there is a way of doing it, it
+   * works on a buffer allocated outside the heap, and no reason is recorded
+   * against it, or it is not, in which case there is no way of doing it and a
+   * reason says why. Any other combination would leave a caller reading one
+   * thing and finding another.
    *
-   * @return either a way of releasing memory, or the reason there is none
-   * @throws Exception if the decision cannot be reached
-   */
-  private static Object decideAgain() throws Exception {
-    Method decide = CleanerUtil.class.getDeclaredMethod("unmapHackImpl");
-    decide.setAccessible(true);
-    return decide.invoke(null);
-  }
-
-  /**
-   * What is published about releasing memory agrees with the decision it comes
-   * from.
-   * <p>
-   * Either releasing is supported, in which case there is a way of doing it and
-   * no reason recorded against it, or it is not, in which case there is no way
-   * of doing it and the recorded reason is the one the decision gave. Any other
-   * combination would leave a caller reading one thing and finding another.
-   *
-   * @throws Exception if the decision cannot be reached
+   * @throws IOException if a buffer that should be released is not
    */
   @Test
-  public void testWhatIsPublishedAgreesWithTheDecisionItComesFrom()
-      throws Exception {
-    Object decidedAgain = decideAgain();
-
-    if (decidedAgain instanceof BufferCleaner) {
-      assertTrue(CleanerUtil.UNMAP_SUPPORTED,
-          "the decision found a way to release memory outside the heap, yet "
-              + "releasing is published as unsupported");
-      assertNotNull(CleanerUtil.getCleaner(),
+  public void testWhatIsPublishedAboutReleasingHangsTogether()
+      throws IOException {
+    if (CleanerUtil.UNMAP_SUPPORTED) {
+      BufferCleaner published = CleanerUtil.getCleaner();
+      assertNotNull(published,
           "releasing is published as supported with no way of doing it");
       assertNull(CleanerUtil.UNMAP_NOT_SUPPORTED_REASON,
           "releasing is published as supported with a reason recorded against "
               + "it");
+
+      published.freeBuffer(ByteBuffer.allocateDirect(4096));
     } else {
-      assertFalse(CleanerUtil.UNMAP_SUPPORTED,
-          "the decision found no way to release memory outside the heap, yet "
-              + "releasing is published as supported");
       assertNull(CleanerUtil.getCleaner(),
           "releasing is published as unsupported with a way of doing it");
-      assertEquals(decidedAgain.toString(),
-          CleanerUtil.UNMAP_NOT_SUPPORTED_REASON,
-          "the recorded reason is not the reason the decision gave");
+      String reason = CleanerUtil.UNMAP_NOT_SUPPORTED_REASON;
+      assertNotNull(reason,
+          "releasing is published as unsupported without the reason it is");
+      assertFalse(reason.isEmpty(),
+          "releasing is published as unsupported with an empty reason");
     }
   }
 

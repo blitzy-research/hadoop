@@ -18,10 +18,16 @@
 
 package org.apache.hadoop.util.concurrent;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.io.IOException;
+import java.security.PrivilegedExceptionAction;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.atomic.AtomicReference;
@@ -29,9 +35,13 @@ import java.util.concurrent.atomic.AtomicReference;
 import javax.security.auth.Subject;
 import javax.security.auth.kerberos.KerberosPrincipal;
 
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.hadoop.security.authentication.util.SubjectUtil;
 import org.apache.hadoop.util.BlockingThreadPoolExecutorService;
 import org.apache.hadoop.util.Daemon;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
@@ -72,6 +82,17 @@ import org.junit.jupiter.api.Timeout;
  * through a constructor that accepts one; the constructors that take no Runnable
  * need {@link SubjectInheritingThread#work()} overridden instead, and are covered in
  * that form.
+ * <p>
+ * A Subject observed is necessary but not sufficient, so each utility is covered a
+ * second time through {@link UserGroupInformation}, which is the interface production
+ * code actually authorizes and audits against. That second reading matters because
+ * {@link UserGroupInformation#getCurrentUser()} falls back to whoever the process
+ * logged in as whenever it finds no Subject: a thread that lost its creator's
+ * identity entirely would still report *a* user, and work would run, be authorized
+ * and be recorded against the wrong one. These tests therefore install a login user
+ * of their own whose name no test ever creates a thread under, and assert both that
+ * the observed user is exactly the creating one and that it is not that login user,
+ * so the fall back is a failure rather than a silent pass.
  */
 public class TestThreadFactorySubjectPropagation {
 
@@ -101,6 +122,59 @@ public class TestThreadFactorySubjectPropagation {
    * operators read, so no assertion here looks at one.
    */
   private static final String THREAD_NAME = "test-subject-propagation";
+
+  /**
+   * The name of the user the process is taken to have logged in as.
+   * <p>
+   * No thread in this class is ever created under this user, so observing it inside a
+   * thread under test can only mean that the creating user's identity failed to reach
+   * that thread and
+   * {@link UserGroupInformation#getCurrentUser()} fell back to the login. That is
+   * exactly the outcome a test asserting only that *some* user was observed would let
+   * through, which is why the login user is named distinctly and asserted against.
+   */
+  private static final String LOGIN_USER = "sentinel-login-user";
+
+  /**
+   * Installs a known login user before each test, so that a fall back to it is
+   * recognisable.
+   * <p>
+   * The identity machinery keeps process-wide state, so it is put into a known state
+   * here rather than being taken as found, and the login user is set explicitly
+   * instead of being left to whichever operating-system account happens to be running
+   * the build.
+   */
+  @BeforeEach
+  public void setUpTheLoginUser() {
+    UserGroupInformation.reset();
+    UserGroupInformation.setConfiguration(new Configuration());
+    UserGroupInformation.setLoginUser(
+        UserGroupInformation.createRemoteUser(LOGIN_USER));
+  }
+
+  /** Leaves no logged in user behind for the next test to find. */
+  @AfterEach
+  public void forgetTheLoginUser() {
+    UserGroupInformation.setLoginUser(null);
+    UserGroupInformation.reset();
+  }
+
+  /**
+   * Reads the user in force on the calling thread.
+   * <p>
+   * A thread under test cannot declare a checked exception, and a failure to read the
+   * identity at all is a failure of the test rather than an observation, so it is
+   * reported as an unchecked exception and leaves the observation unwritten.
+   *
+   * @return the user in force, which is the login user when no Subject is in force
+   */
+  private static UserGroupInformation currentUser() {
+    try {
+      return UserGroupInformation.getCurrentUser();
+    } catch (IOException e) {
+      throw new IllegalStateException("the user in force could not be read", e);
+    }
+  }
 
   /**
    * Builds a Subject carrying a single, distinctly named principal.
@@ -147,6 +221,51 @@ public class TestThreadFactorySubjectPropagation {
         "thread under test did not finish within " + JOIN_TIMEOUT_MILLIS + " ms");
     assertSame(creator, observed.get(),
         "thread under test did not observe the creating thread's Subject");
+  }
+
+  /**
+   * Asserts that the thread under test finished, and that it ran as exactly the user
+   * that created it rather than as the process login.
+   * <p>
+   * Three readings are needed, and each rules out a different way of appearing to
+   * work. The Subject is compared by identity against the one the creating thread held
+   * inside its own scope, which is the strongest available form and the one the
+   * utilities can satisfy, since they re-establish the very instance. The user is then
+   * compared as an identity, which {@link UserGroupInformation#equals(Object)} decides
+   * by comparing Subjects by reference, so a second user carrying the same name cannot
+   * satisfy it. Finally the observed user's name is required to differ from the login
+   * user's, which is what catches an identity that never arrived: without that
+   * reading, a thread running as the process login would report a perfectly valid user
+   * and the assertion would pass.
+   *
+   * @param creator        the user whose scope the thread was created and started in
+   * @param creatorSubject the Subject in force on the creating thread, read there
+   * @param observedSubject the Subject the thread under test read back
+   * @param observedUser   the user the thread under test read back
+   * @param worker         the thread under test
+   */
+  private static void assertObservedCreatorUser(UserGroupInformation creator,
+      AtomicReference<Subject> creatorSubject,
+      AtomicReference<Subject> observedSubject,
+      AtomicReference<UserGroupInformation> observedUser,
+      AtomicReference<Thread> worker) {
+    assertFalse(worker.get().isAlive(),
+        "thread under test did not finish within " + JOIN_TIMEOUT_MILLIS + " ms");
+    assertNotNull(creatorSubject.get(),
+        "the creating thread held no Subject inside the scope of the user that "
+            + "established it, so this assertion would prove nothing");
+    assertSame(creatorSubject.get(), observedSubject.get(),
+        "thread under test did not observe the Subject in force on the thread that "
+            + "created it");
+    assertNotNull(observedUser.get(),
+        "thread under test never read back the user it was running as");
+    assertEquals(creator, observedUser.get(),
+        "thread under test did not run as the user that created it");
+    assertEquals(creator.getUserName(), observedUser.get().getUserName(),
+        "thread under test ran as a user of another name");
+    assertNotEquals(LOGIN_USER, observedUser.get().getUserName(),
+        "thread under test ran as the process login user, so the creating user's "
+            + "identity never reached it");
   }
 
   @Test
@@ -487,6 +606,219 @@ public class TestThreadFactorySubjectPropagation {
     assertObservedCreatorSubject(creator, observed, worker);
     assertTrue(worker.get().isDaemon(),
         "newDaemonThreadFactory did not produce a daemon thread");
+  }
+
+  /**
+   * A thread created and started inside a user's scope runs as that user.
+   * <p>
+   * This is the same guarantee as the Subject tests above, read through the interface
+   * production code authorizes and audits against, and it is the reading that would
+   * catch an identity replaced by the process login rather than merely absent.
+   *
+   * @throws Exception if the identity cannot be established or a wait is interrupted
+   */
+  @Test
+  @Timeout(value = 30)
+  public void testSubjectInheritingThreadServesTheCreatingUser() throws Exception {
+    final UserGroupInformation creator =
+        UserGroupInformation.createRemoteUser("sit-creating-user");
+    final AtomicReference<Subject> creatorSubject = new AtomicReference<>();
+    final AtomicReference<Subject> observedSubject = new AtomicReference<>();
+    final AtomicReference<UserGroupInformation> observedUser =
+        new AtomicReference<>();
+    final AtomicReference<Thread> worker = new AtomicReference<>();
+
+    creator.doAs(new PrivilegedExceptionAction<Void>() {
+      @Override
+      public Void run() throws InterruptedException {
+        creatorSubject.set(SubjectUtil.current());
+        SubjectInheritingThread t = new SubjectInheritingThread() {
+          @Override
+          public void work() {
+            observedSubject.set(SubjectUtil.current());
+            observedUser.set(currentUser());
+          }
+        };
+        worker.set(t);
+        t.start();
+        t.join(JOIN_TIMEOUT_MILLIS);
+        return null;
+      }
+    });
+
+    assertObservedCreatorUser(creator, creatorSubject, observedSubject, observedUser,
+        worker);
+  }
+
+  /**
+   * A daemon created and started inside a user's scope runs as that user.
+   *
+   * @throws Exception if the identity cannot be established or a wait is interrupted
+   */
+  @Test
+  @Timeout(value = 30)
+  public void testDaemonServesTheCreatingUser() throws Exception {
+    final UserGroupInformation creator =
+        UserGroupInformation.createRemoteUser("daemon-creating-user");
+    final AtomicReference<Subject> creatorSubject = new AtomicReference<>();
+    final AtomicReference<Subject> observedSubject = new AtomicReference<>();
+    final AtomicReference<UserGroupInformation> observedUser =
+        new AtomicReference<>();
+    final AtomicReference<Thread> worker = new AtomicReference<>();
+
+    creator.doAs(new PrivilegedExceptionAction<Void>() {
+      @Override
+      public Void run() throws InterruptedException {
+        creatorSubject.set(SubjectUtil.current());
+        Runnable r = new Runnable() {
+          @Override
+          public void run() {
+            observedSubject.set(SubjectUtil.current());
+            observedUser.set(currentUser());
+          }
+        };
+
+        Daemon t = new Daemon(r);
+        worker.set(t);
+        t.start();
+        t.join(JOIN_TIMEOUT_MILLIS);
+        return null;
+      }
+    });
+
+    assertObservedCreatorUser(creator, creatorSubject, observedSubject, observedUser,
+        worker);
+    assertTrue(worker.get().isDaemon(), "Daemon was not created as a daemon thread");
+  }
+
+  /**
+   * A thread obtained from the daemon factory inside a user's scope runs as that user.
+   *
+   * @throws Exception if the identity cannot be established or a wait is interrupted
+   */
+  @Test
+  @Timeout(value = 30)
+  public void testDaemonFactoryServesTheCreatingUser() throws Exception {
+    final UserGroupInformation creator =
+        UserGroupInformation.createRemoteUser("daemon-factory-creating-user");
+    final AtomicReference<Subject> creatorSubject = new AtomicReference<>();
+    final AtomicReference<Subject> observedSubject = new AtomicReference<>();
+    final AtomicReference<UserGroupInformation> observedUser =
+        new AtomicReference<>();
+    final AtomicReference<Thread> worker = new AtomicReference<>();
+
+    creator.doAs(new PrivilegedExceptionAction<Void>() {
+      @Override
+      public Void run() throws InterruptedException {
+        creatorSubject.set(SubjectUtil.current());
+        Runnable r = new Runnable() {
+          @Override
+          public void run() {
+            observedSubject.set(SubjectUtil.current());
+            observedUser.set(currentUser());
+          }
+        };
+
+        ThreadFactory factory = new Daemon.DaemonFactory();
+        Thread t = factory.newThread(r);
+        worker.set(t);
+        t.start();
+        t.join(JOIN_TIMEOUT_MILLIS);
+        return null;
+      }
+    });
+
+    assertObservedCreatorUser(creator, creatorSubject, observedSubject, observedUser,
+        worker);
+    assertTrue(worker.get().isDaemon(),
+        "DaemonFactory did not produce a daemon thread");
+  }
+
+  /**
+   * A thread obtained from the blocking pool's factory inside a user's scope runs as
+   * that user.
+   *
+   * @throws Exception if the identity cannot be established or a wait is interrupted
+   */
+  @Test
+  @Timeout(value = 30)
+  public void testDaemonThreadFactoryServesTheCreatingUser() throws Exception {
+    final UserGroupInformation creator =
+        UserGroupInformation.createRemoteUser("daemon-thread-factory-creating-user");
+    final AtomicReference<Subject> creatorSubject = new AtomicReference<>();
+    final AtomicReference<Subject> observedSubject = new AtomicReference<>();
+    final AtomicReference<UserGroupInformation> observedUser =
+        new AtomicReference<>();
+    final AtomicReference<Thread> worker = new AtomicReference<>();
+
+    creator.doAs(new PrivilegedExceptionAction<Void>() {
+      @Override
+      public Void run() throws InterruptedException {
+        creatorSubject.set(SubjectUtil.current());
+        Runnable r = new Runnable() {
+          @Override
+          public void run() {
+            observedSubject.set(SubjectUtil.current());
+            observedUser.set(currentUser());
+          }
+        };
+
+        ThreadFactory factory =
+            BlockingThreadPoolExecutorService.newDaemonThreadFactory(THREAD_NAME);
+        Thread t = factory.newThread(r);
+        worker.set(t);
+        t.start();
+        t.join(JOIN_TIMEOUT_MILLIS);
+        return null;
+      }
+    });
+
+    assertObservedCreatorUser(creator, creatorSubject, observedSubject, observedUser,
+        worker);
+    assertTrue(worker.get().isDaemon(),
+        "newDaemonThreadFactory did not produce a daemon thread");
+  }
+
+  /**
+   * A thread created with no user in force runs as the process login and as nobody
+   * else.
+   * <p>
+   * This is what makes the assertions above mean something. It establishes that the
+   * login user really is observable when no identity was established, so a test that
+   * observes the creating user instead has observed something the machinery had to
+   * carry there, and it establishes that a thread created outside any scope does not
+   * pick up the identity of some earlier creator.
+   *
+   * @throws Exception if a wait is interrupted
+   */
+  @Test
+  @Timeout(value = 30)
+  public void testThreadCreatedWithNoUserRunsAsTheLoginUser() throws Exception {
+    final AtomicReference<Subject> observedSubject = new AtomicReference<>();
+    final AtomicReference<UserGroupInformation> observedUser =
+        new AtomicReference<>();
+
+    assertNull(SubjectUtil.current(),
+        "a Subject was already in force on the thread creating this one, so this "
+            + "assertion would not be about a thread created without one");
+    SubjectInheritingThread t = new SubjectInheritingThread() {
+      @Override
+      public void work() {
+        observedSubject.set(SubjectUtil.current());
+        observedUser.set(currentUser());
+      }
+    };
+    t.start();
+    t.join(JOIN_TIMEOUT_MILLIS);
+
+    assertFalse(t.isAlive(),
+        "thread under test did not finish within " + JOIN_TIMEOUT_MILLIS + " ms");
+    assertNull(observedSubject.get(),
+        "a thread created with no Subject in force observed one");
+    assertNotNull(observedUser.get(),
+        "thread under test never read back the user it was running as");
+    assertEquals(LOGIN_USER, observedUser.get().getUserName(),
+        "a thread created with no user in force did not run as the process login");
   }
 
 }

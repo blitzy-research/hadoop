@@ -25,8 +25,11 @@ import org.slf4j.LoggerFactory;
 
 import java.util.List;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.Callable;
 import java.util.concurrent.Future;
+import java.util.concurrent.FutureTask;
 import java.util.concurrent.RejectedExecutionHandler;
+import java.util.concurrent.RunnableFuture;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
@@ -114,6 +117,56 @@ public final class HadoopThreadPoolExecutor extends ThreadPoolExecutor {
   @Override
   public void execute(Runnable command) {
     super.execute(SubjectPreservingTasks.wrap(command));
+  }
+
+  /**
+   * Builds the future that a task submitted for its result is reported through,
+   * as one that gives up its place on the queue as soon as it is cancelled.
+   * <p>
+   * A task submitted for a result reaches the queue prepared with the identity
+   * of its submitter, and that identity, together with the credentials in it,
+   * stays reachable for as long as the queue holds the prepared task. Cancelling
+   * the future releases what the future itself was holding but says nothing to
+   * the queue, so a cancelled task keeps its submitter's credentials alive until
+   * something else displaces it -- which, for a pool whose workers are all
+   * occupied or whose queue has stopped draining, may be never. Reclaiming the
+   * place at the moment of cancellation is what bounds that, and doing it here
+   * is what makes it happen on its own rather than only when a caller thinks to
+   * ask for it. {@link #purge()} remains for the tasks this cannot reach.
+   * <p>
+   * Nothing is prepared here. Preparing a task remains the business of
+   * {@link #execute(Runnable)} alone, so a submission still passes exactly one
+   * such point and the prepared task still has exactly one layer for
+   * {@link SubjectPreservingTasks#unwrap(Runnable)} to take back off. The future
+   * this returns is a {@link java.util.concurrent.FutureTask} like the one it
+   * replaces and behaves as that one does in every other respect: run in the
+   * same way, cancelled in the same way, and reporting the same result and the
+   * same failure to whoever holds it. Its own type is therefore what the line
+   * written before such a task runs names, that line naming the task this pool
+   * was handed as it always has.
+   *
+   * @param <T> the result type of the task
+   * @param callable the task to be called for its result
+   * @return a future that reclaims its place on the queue when cancelled
+   */
+  @Override
+  protected <T> RunnableFuture<T> newTaskFor(Callable<T> callable) {
+    return new QueueReclaimingFutureTask<>(callable);
+  }
+
+  /**
+   * Builds the future that a task submitted without a result of its own is
+   * reported through, on the same terms as
+   * {@link #newTaskFor(java.util.concurrent.Callable)}.
+   *
+   * @param <T> the type of the given result
+   * @param runnable the task to be run
+   * @param value the result to report once the task has run
+   * @return a future that reclaims its place on the queue when cancelled
+   */
+  @Override
+  protected <T> RunnableFuture<T> newTaskFor(Runnable runnable, T value) {
+    return new QueueReclaimingFutureTask<>(runnable, value);
   }
 
   /**
@@ -205,5 +258,47 @@ public final class HadoopThreadPoolExecutor extends ThreadPoolExecutor {
   protected void afterExecute(Runnable r, Throwable t) {
     super.afterExecute(r, t);
     ExecutorHelper.logThrowableFromAfterExecute(r, t);
+  }
+
+  /**
+   * The future a task submitted for its result is reported through, which gives
+   * up the task's place on the queue as soon as the task is cancelled.
+   * <p>
+   * A task completes once, and being cancelled is one of the ways it completes,
+   * so the reclaiming below happens at most once for a task and only ever for a
+   * task that will not be run. It goes through {@link #remove(Runnable)}, which
+   * recognises the prepared form the queue is holding, so the entry that carries
+   * the submitter's identity is the entry that is reclaimed and the identity
+   * stops being reachable through this pool. A task that is no longer on the
+   * queue -- because a worker took it, or because the pool was stopped -- is
+   * simply not found there, and nothing happens.
+   * <p>
+   * No identity is captured or prepared here, and no task is decorated. This
+   * exists only to notice cancellation, so a submission still passes exactly one
+   * preparing point, in {@link #execute(Runnable)}, and the prepared task still
+   * has exactly one layer to be taken back off.
+   *
+   * @param <T> the result type of the task
+   */
+  private final class QueueReclaimingFutureTask<T> extends FutureTask<T> {
+
+    QueueReclaimingFutureTask(Callable<T> callable) {
+      super(callable);
+    }
+
+    QueueReclaimingFutureTask(Runnable runnable, T value) {
+      super(runnable, value);
+    }
+
+    /**
+     * Reclaims this task's place on the queue, once it is known that the task
+     * has been cancelled and so will never be run.
+     */
+    @Override
+    protected void done() {
+      if (isCancelled()) {
+        remove(this);
+      }
+    }
   }
 }
