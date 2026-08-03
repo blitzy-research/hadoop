@@ -1701,8 +1701,11 @@ unfailable whatever the code does, which is also why none of these classes is
 touched by this change — `metrics2/sink` in particular contains no hunk of it.
 
 This is a property of the environment, not of the code, and not of the JDK.
-Running the same suites as an unprivileged user removes these failures. They are
-documented here rather than excluded.
+Running the same suites as an unprivileged user removes these failures — measured,
+not assumed: see
+[The whole module with both environmental causes removed](#The_whole_module_with_both_environmental_causes_removed),
+where the classes listed here pass in full from the same bytecode and the same
+command. They are documented here rather than excluded.
 
 ### The 15th failure: `libhadoop.so` is absent
 
@@ -1733,7 +1736,7 @@ with `-Drequire.test.libhadoop=false` for the test runs.
 | Corrected thirteen-module reactor build, `clean install -DskipTests` | `BUILD SUCCESS`, exit 0, zero `[ERROR]` lines, 13/13 modules | `BUILD SUCCESS`, exit 0, zero `[ERROR]` lines, 13/13 modules |
 | Source warnings from that build | 18, all pre-existing and catalogued below | 8, the same main-source pair (JDK 17's `javac` does not emit the boxed-constructor notes) |
 | Emitted bytecode level | `major version: 61` (release 17) | `major version: 61` |
-| `util/concurrent` package — 4 test classes (the 3 new suites plus the pre-existing `TestSubjectPropagation`) | 77 run / 0 failures / 0 errors / 0 skipped | 77 / 0 / 0 / 0 |
+| `util/concurrent` package — 4 test classes (the 3 new suites plus the pre-existing `TestSubjectPropagation`) | 86 run / 0 failures / 0 errors / 0 skipped | 86 / 0 / 0 / 0 |
 | `security/**` + `util/**` slice — 141 test classes | 1030 run / 13 failures / 0 errors / 36 skipped | 1030 / 13 / 0 / 36 |
 | `io/**` + `metrics2/**` + `crypto/key/**` slice — 133 test classes | 1010 run / 1 failure / 0 errors / 155 skipped | 1010 / 1 / 0 / 155 |
 | `hadoop-auth` full suite — 24 test classes | 179 run / 0 failures / 0 errors / 0 skipped | 179 / 0 / 0 / 0 |
@@ -1750,6 +1753,69 @@ uid-0 kind in files this change never touches —
 `fs/shell/TestPathData.testGlobThrowsExceptionForUnreadableDir` is one, at
 12 run / 1 failure / 0 errors / 2 skipped on both runtimes alike — and those are
 environmental for exactly the reason given above rather than regressions.
+
+### The whole module with both environmental causes removed
+
+The slices above bound the risk; the figures below settle it. Every environmental
+cause named on this page is a property of the harness rather than of the code, so
+each can be removed without touching a repository file, a POM or an exclusion —
+the superuser bypass by running as an unprivileged user, and the absent native
+library by building it from the native sources this change leaves untouched. With
+both removed, the whole of `hadoop-common` was run, and the native library was
+*required* rather than waived:
+
+```
+useradd -m hadooptest                     # any unprivileged account will do
+mvn -pl hadoop-common-project/hadoop-common -Pnative install -DskipTests \
+    -Drequire.snappy -Drequire.zstd -Drequire.openssl \
+    -Drequire.isal -Disal.lib=/usr/lib/x86_64-linux-gnu
+LD_LIBRARY_PATH=<module>/target/native/target/usr/local/lib:/usr/lib/x86_64-linux-gnu \
+mvn -pl hadoop-common-project/hadoop-common surefire:test \
+    -Drequire.test.libhadoop=true -Disal.lib=/usr/lib/x86_64-linux-gnu
+```
+
+| Measurement, whole module, unprivileged, `require.test.libhadoop=true` | JDK 25 | JDK 17 |
+|---|---|---|
+| `hadoop-common` complete suite | 5,449 run / **0 failures** / **0 errors** / 206 skipped | 5,449 / **0** / **0** / 206 |
+| `hadoop-auth` + `hadoop-nfs` + `hadoop-kms` + `hadoop-registry` + `hadoop-minikdc` | 418 run / 0 failures / 0 errors / 0 skipped | 418 / 0 / 0 / 0 |
+| Grand total across the in-scope tree | **5,867 run / 0 failures / 0 errors** | **5,867 / 0 / 0** |
+
+Three things follow, and each is a measurement rather than an expectation:
+
+* The superuser diagnosis is **confirmed, not inferred**. The eleven classes that
+  fail as uid 0 — `fs/TestLocalDirAllocator` (9), `util/TestDiskChecker` (6),
+  `util/TestBasicDiskValidator` (6), `fs/TestFileUtil` (5),
+  `fs/TestFSMainOperationsLocalFileSystem` (2), its `fs/viewfs` counterpart (2),
+  `fs/TestFsShellCopy` (2), `fs/TestLocalFileSystem` (1),
+  `fs/shell/TestPathData` (1), `metrics2/sink/TestRollingFileSystemSinkWithLocal`
+  (1) and `util/TestReadWriteDiskValidator` (1) — pass in full, 297 run / 0
+  failures / 0 errors, from the same bytecode, the same JDK and the same command
+  once the process is not root.
+* `util/TestNativeCodeLoader` passes under `-Drequire.test.libhadoop=true`. The
+  workaround documented above remains the right answer for an environment without
+  the library; it is not the only one, because the library builds cleanly on
+  JDK 25 with `libhadoop.so` at 744,928 bytes and `hadoop checknative -a`
+  reporting `hadoop`, `zlib`, `zstd`, `bzip2`, `openssl` and `ISA-L` all `true`.
+  Building it also turns roughly 130 native skips into passes, among them
+  `io/nativeio/TestNativeIO`, `util/TestNativeCrc32`,
+  `io/compress/zstd/TestZStandardCompressorDecompressor`,
+  `net/unix/TestDomainSocket` and the three ISA-L raw-coder suites.
+* The differential is now **zero against zero** rather than equal and non-zero.
+  Every count in the table above matches between the runtimes exactly, which says
+  what the earlier slice differential could only say of a subset: nothing here
+  regressed on JDK 25, and nothing regressed on JDK 17 either.
+
+The 206 remaining skips are capability and platform self-exclusions, each declared
+by the test that skips: 67 FTP contract cases that `assumeEnabled()` aborts because
+`src/test/resources/contract/ftp.xml` names no endpoint, 49 local-filesystem
+contract capabilities the contract declares unsupported, 21 crypto-stream
+`@Disabled` capability statements, 22 Windows-only cases, 11 append and bulk-delete
+capabilities, 10 symlink capabilities, 8 in `ipc/TestProtoBufRpc` that the tests
+themselves skip with `assumeFalse(testWithLegacy)`, 7 in `io/nativeio/TestNativeIO`
+needing persistent-memory hardware or Windows, 3 needing an OpenSSL cipher this
+build of OpenSSL does not offer, and 8 assorted external-service assumptions such
+as `security/TestUGIWithExternalKdc` and `ha/TestSshFenceByTcpPort`. None was added
+by this change: the `@Disabled` count is 28 at the base commit and 28 after it.
 
 The bytecode check was taken on all six seam classes rather than on a sample:
 `HadoopExecutors`, `SubjectPreservingTasks`, `HadoopThreadPoolExecutor`,
