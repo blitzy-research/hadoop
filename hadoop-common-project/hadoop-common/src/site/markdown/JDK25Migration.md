@@ -769,7 +769,7 @@ builds its workers as `SubjectInheritingThread`s, and so does the
 `UserGroupInformation` TGT-renewer pool at `security/UserGroupInformation.java:L934`;
 that class captures the creator's identity in its `start()` override at
 `util/concurrent/SubjectInheritingThread.java:L179-184` and re-establishes it
-around the whole of `work()` at `:L201-203`, which would give a subjectless task
+around the whole of `work()` at `:L201-215`, which would give a subjectless task
 the worker's creator. **It does not, because that override never runs for a pool
 worker.** From JDK 21 a `ThreadPoolExecutor` starts its workers through the
 thread container that owns them — `container.start(t)` at
@@ -973,7 +973,7 @@ than an oversight.
 * **Three call sites that already route correctly** — `util/ShutdownHookManager.java:L80`, `hadoop-registry/.../RegistryAdminService.java:L113` and the cached-pool site in `hadoop-registry/.../RegistryDNS.java` (base-commit `:L172`, now `:L171`) already call `HadoopExecutors`, so the centralized fix reaches them automatically and none received a hunk. Editing them would be a change with no defect behind it. The first two files are untouched entirely; `RegistryDNS` was edited only at its *other* pool site, a raw `Executors.newSingleThreadExecutor()` at base-commit `:L1177`, which is why the cached-pool line above shifted by one.
 * **The superseded capture idiom in `UserGroupInformation`** (base-commit `:L934-936`, where the TGT-renewer pool's `ThreadFactory` returns a `SubjectInheritingThread`) is left in place; removing it is cleanup, not migration. It is genuinely superseded rather than merely redundant: on JDK 25 that thread's `start()` override never runs, because a pool starts its workers through their thread container instead, so the idiom propagates nothing there and the submission-time capture is what makes the renewer's task run as the right user; on JDK 17 the runtime propagates the identity itself and both are no-ops. The measurement is entry (v) of the [Behavioural Resolution Register](#Behavioural_Resolution_Register).
 * **The `MakeAccessible` class** at `util/dynamic/DynMethods.java:529` is retained and simply invoked directly.
-* **Cosmetic and typographic issues**, deliberately untouched: the "Kerbeors" spelling in a `UserGroupInformation` javadoc comment (base-commit `:L946`); the unused `import org.apache.hadoop.util.Shell;` at `TestSubjectPropagation.java:30`; the 114-character line at `util/Daemon.java:36`; and the three coexisting license-header styles inside `util/concurrent` — a clean form in `package-info.java`, a form carrying a stray ` * *` line in the seam classes, and a one-space `/**` form in `SubjectInheritingThread.java` — which are **not** normalized.
+* **Cosmetic and typographic issues**, deliberately untouched: the "Kerbeors" spelling in a `UserGroupInformation` javadoc comment (base-commit `:L946`); the unused `import org.apache.hadoop.util.Shell;` at `TestSubjectPropagation.java:30`; the 114-character line at `util/Daemon.java:36`; and the three coexisting license-header styles inside `util/concurrent` — a clean form in `package-info.java`, a form carrying a stray ` * *` line in the four pre-existing seam files (`ExecutorHelper.java`, `HadoopExecutors.java`, `HadoopThreadPoolExecutor.java` and `HadoopScheduledThreadPoolExecutor.java`, and nowhere else in the package — the three new `SubjectPreserving*` files do not reproduce it), and a one-space `/**` form in `SubjectInheritingThread.java` — which are **not** normalized.
 * **Two out-of-module POM warnings** surfaced by the reactor and left to their owners: a duplicate `org.mockito:mockito-junit-jupiter` declaration in `hadoop-yarn-server-nodemanager`, and a missing `protobuf-maven-plugin` version in `hadoop-yarn-csi`.
 
 Some context makes these deferrals honest rather than negligent: **checkstyle
@@ -1376,9 +1376,14 @@ with `-Drequire.test.libhadoop=false` for the test runs.
 | `hadoop-nfs` full suite — 3 test classes | 21 run / 0 failures / 0 errors / 0 skipped | 21 / 0 / 0 / 0 |
 
 Every failure in those totals is accounted for above: 13 uid-0 failures in the
-first slice, 1 in the second, and nothing anywhere else. Omitting
+first slice, 1 in the second, and nothing else inside either. Omitting
 `-Drequire.test.libhadoop=false` adds exactly one more, in
-`util/TestNativeCodeLoader`, on either runtime.
+`util/TestNativeCodeLoader`, on either runtime. The two slices do not span the
+whole module, so a wider `-Dtest` pattern reaches further failures of the same
+uid-0 kind in files this change never touches —
+`fs/shell/TestPathData.testGlobThrowsExceptionForUnreadableDir` is one, at
+12 run / 1 failure / 0 errors / 2 skipped on both runtimes alike — and those are
+environmental for exactly the reason given above rather than regressions.
 
 The bytecode check was taken on all six seam classes rather than on a sample:
 `HadoopExecutors`, `SubjectPreservingTasks`, `HadoopThreadPoolExecutor`,
@@ -1533,7 +1538,7 @@ executor task submitted from it.
 
 **`mvn -pl hadoop-common-project -am clean install -DskipTests` is a false
 green and must not be used as an acceptance gate.** Re-measured live: it
-completes in roughly **1.2 to 3.2 seconds** and builds only **four** modules —
+completes in **seconds rather than minutes** and builds only **four** modules —
 `[1/4]` Apache Hadoop Main, `[2/4]` Apache Hadoop Build Tools, `[3/4]` Apache
 Hadoop Project POM, `[4/4]` Apache Hadoop Common Project — then reports
 `BUILD SUCCESS`. The fourth is the **aggregator POM itself**. **None of
@@ -1552,6 +1557,12 @@ The on-disk proof is that `hadoop-common-project/pom.xml` declares
 `hadoop-registry` (`:L40`). It has no source directory and no compiler or
 surefire plugin configuration, so it genuinely compiles nothing.
 
+How few seconds it takes is host-dependent and is not the point: repeated runs
+reported anywhere from **1.2 s to 12 s** as the local repository and the
+filesystem cache warmed up. What settles it is the module list — a reactor that
+never enters a leaf module cannot have compiled one — so check the selection
+rather than the clock.
+
 ### The corrected invocation
 
 This is the command that was actually verified, and it builds all thirteen
@@ -1569,8 +1580,9 @@ Verified reactor: `[1/13]` Main, `[2/13]` Build Tools, `[3/13]` Project POM,
 `[4/13]` Annotations, `[5/13]` Project Dist POM, `[6/13]` Maven Plugins,
 `[7/13]` MiniKDC, `[8/13]` Auth, `[9/13]` Auth Examples, `[10/13]` Common,
 `[11/13]` NFS, `[12/13]` KMS, `[13/13]` Registry — `BUILD SUCCESS`, zero
-`[ERROR]` lines, 02:24 min against a cold local repository and well under a
-minute against a warm one, on JDK 25 and on JDK 17 alike.
+`[ERROR]` lines, 02:24 min against a cold local repository and about a minute
+against a warm one — measured warm runs land between 40 s and 01:01 min — on
+JDK 25 and on JDK 17 alike.
 
 The same `-pl` list applies to the test invocation, and the whole sequence is
 repeated with `JAVA_HOME` pointing at JDK 17 as the compatibility check. In a
