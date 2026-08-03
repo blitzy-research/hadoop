@@ -28,6 +28,7 @@ import java.util.concurrent.TimeUnit;
 
 import org.apache.hadoop.classification.InterfaceAudience;
 import org.apache.hadoop.classification.InterfaceStability;
+import org.apache.hadoop.util.concurrent.HadoopThreadPoolExecutor;
 import org.apache.hadoop.util.concurrent.SubjectInheritingThread;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -81,7 +82,7 @@ public class AsyncDiskService {
     
     // Create one ThreadPool per volume
     for (int v = 0 ; v < volumes.length; v++) {
-      ThreadPoolExecutor executor = new ThreadPoolExecutor(
+      ThreadPoolExecutor executor = new HadoopThreadPoolExecutor(
           CORE_THREADS_PER_VOLUME, MAXIMUM_THREADS_PER_VOLUME, 
           THREADS_KEEP_ALIVE_SECONDS, TimeUnit.SECONDS, 
           new LinkedBlockingQueue<Runnable>(), threadFactory);

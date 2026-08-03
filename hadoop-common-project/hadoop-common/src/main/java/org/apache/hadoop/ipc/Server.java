@@ -66,7 +66,6 @@ import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -124,6 +123,7 @@ import org.apache.hadoop.util.ExitUtil;
 import org.apache.hadoop.util.ProtoUtil;
 import org.apache.hadoop.util.StringUtils;
 import org.apache.hadoop.util.Time;
+import org.apache.hadoop.util.concurrent.HadoopScheduledThreadPoolExecutor;
 import org.apache.hadoop.util.concurrent.SubjectInheritingThread;
 
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -3478,7 +3478,7 @@ public abstract class Server {
     this.metricsUpdaterInterval =
         conf.getLong(CommonConfigurationKeysPublic.IPC_SERVER_METRICS_UPDATE_RUNNER_INTERVAL,
             CommonConfigurationKeysPublic.IPC_SERVER_METRICS_UPDATE_RUNNER_INTERVAL_DEFAULT);
-    this.scheduledExecutorService = new ScheduledThreadPoolExecutor(1,
+    this.scheduledExecutorService = new HadoopScheduledThreadPoolExecutor(1,
         new ThreadFactoryBuilder().setDaemon(true).setNameFormat("Hadoop-Metrics-Updater-%d")
             .build());
     this.scheduledExecutorService.scheduleWithFixedDelay(new MetricsUpdateRunner(),

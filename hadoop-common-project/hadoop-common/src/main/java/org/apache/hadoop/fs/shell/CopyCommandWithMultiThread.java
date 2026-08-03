@@ -25,6 +25,7 @@ import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 
 import org.apache.hadoop.classification.VisibleForTesting;
+import org.apache.hadoop.util.concurrent.HadoopThreadPoolExecutor;
 
 /**
  * Abstract command to enable sub copy commands run with multi-thread.
@@ -119,7 +120,7 @@ public abstract class CopyCommandWithMultiThread
 
   private void initThreadPoolExecutor() {
     executor =
-        new ThreadPoolExecutor(threadCount, threadCount, 1, TimeUnit.SECONDS,
+        new HadoopThreadPoolExecutor(threadCount, threadCount, 1, TimeUnit.SECONDS,
             new ArrayBlockingQueue<>(threadPoolQueueSize),
             new ThreadPoolExecutor.CallerRunsPolicy());
   }

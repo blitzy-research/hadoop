@@ -59,9 +59,7 @@ public final class BlockingThreadPoolExecutorService
    * @return a {@link java.util.concurrent.ThreadFactory} that names threads
    */
   static ThreadFactory getNamedThreadFactory(final String prefix) {
-    SecurityManager s = System.getSecurityManager();
-    final ThreadGroup threadGroup = (s != null) ? s.getThreadGroup() :
-        Thread.currentThread().getThreadGroup();
+    final ThreadGroup threadGroup = Thread.currentThread().getThreadGroup();
 
     return new ThreadFactory() {
       private final AtomicInteger threadNumber = new AtomicInteger(1);

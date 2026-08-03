@@ -313,7 +313,7 @@ public class KerberosAuthenticator implements Authenticator {
       if (LOG.isDebugEnabled()) {
         LOG.debug("Using subject: " + subject);
       }
-      Subject.doAs(subject, new PrivilegedExceptionAction<Void>() {
+      SubjectUtil.doAs(subject, new PrivilegedExceptionAction<Void>() {
 
         @Override
         public Void run() throws Exception {

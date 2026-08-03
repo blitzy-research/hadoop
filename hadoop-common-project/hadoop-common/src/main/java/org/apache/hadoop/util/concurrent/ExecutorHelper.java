@@ -33,6 +33,7 @@ public final class ExecutorHelper {
       .getLogger(ExecutorHelper.class);
 
   static void logThrowableFromAfterExecute(Runnable r, Throwable t) {
+    r = SubjectPreservingTasks.unwrap(r);
     if (LOG.isDebugEnabled()) {
       LOG.debug("afterExecute in thread: " + Thread.currentThread()
           .getName() + ", runnable type: " + r.getClass().getName());

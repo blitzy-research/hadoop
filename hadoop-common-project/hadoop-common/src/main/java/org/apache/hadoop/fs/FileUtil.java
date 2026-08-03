@@ -50,7 +50,6 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.jar.Attributes;
 import java.util.jar.JarOutputStream;
@@ -74,6 +73,7 @@ import org.apache.hadoop.io.nativeio.NativeIO;
 import org.apache.hadoop.util.Shell;
 import org.apache.hadoop.util.Shell.ShellCommandExecutor;
 import org.apache.hadoop.util.StringUtils;
+import org.apache.hadoop.util.concurrent.HadoopExecutors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -891,7 +891,7 @@ public class FileUtil {
     int exitCode;
     try {
       // Consume stdout and stderr, to avoid blocking the command
-      executor = Executors.newFixedThreadPool(2);
+      executor = HadoopExecutors.newFixedThreadPool(2);
       Future output = executor.submit(() -> {
         try {
           // Read until the output stream receives an EOF and closed.

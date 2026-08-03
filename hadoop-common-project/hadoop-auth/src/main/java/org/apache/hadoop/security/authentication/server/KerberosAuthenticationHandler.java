@@ -19,6 +19,7 @@ import org.apache.hadoop.security.authentication.client.KerberosAuthenticator;
 import org.apache.commons.codec.binary.Base64;
 import org.apache.hadoop.security.authentication.util.KerberosName;
 import org.apache.hadoop.security.authentication.util.KerberosUtil;
+import org.apache.hadoop.security.authentication.util.SubjectUtil;
 import org.ietf.jgss.GSSException;
 import org.ietf.jgss.GSSContext;
 import org.ietf.jgss.GSSCredential;
@@ -201,7 +202,7 @@ public class KerberosAuthenticationHandler implements AuthenticationHandler {
       }
 
       try {
-        gssManager = Subject.doAs(serverSubject,
+        gssManager = SubjectUtil.doAs(serverSubject,
             new PrivilegedExceptionAction<GSSManager>() {
               @Override
               public GSSManager run() throws Exception {
@@ -334,7 +335,7 @@ public class KerberosAuthenticationHandler implements AuthenticationHandler {
               "Invalid server principal " + serverPrincipal +
               "decoded from client request");
         }
-        token = Subject.doAs(serverSubject,
+        token = SubjectUtil.doAs(serverSubject,
             new PrivilegedExceptionAction<AuthenticationToken>() {
               @Override
               public AuthenticationToken run() throws Exception {

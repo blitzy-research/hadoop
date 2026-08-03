@@ -28,13 +28,32 @@ import org.apache.hadoop.security.authentication.util.SubjectUtil;
  * JEP411/JEP486 changes.
  * <p>
  * Java propagates the current Subject to any new Threads in all version up to
- * Java 21. In Java 22-23 the Subject is only propagated if the SecurityManager
- * is enabled, while in Java 24+ it is never propagated.
+ * Java 21. In Java 22-23 the Subject is only propagated conditionally, while in
+ * Java 24+ it is never propagated.
  * <p>
  * Hadoop security heavily relies on the original behavior, as Subject is at the
  * core of JAAS. This class wraps thread. It overrides start() and saves the
  * Subject of the current thread, and wraps the payload in a
  * Subject.doAs()/callAs() call to restore it in the newly created Thread.
+ * <p>
+ * This mechanism covers threads: the Subject is captured in {@link #start()} on
+ * the thread that starts this one, and re-established for the whole lifetime of
+ * the new thread by {@link #run()}. It cannot cover a task submitted to a thread
+ * pool, because a capture taken once per worker binds the identity that caused
+ * that worker to exist, and every later task the worker runs would execute under
+ * it. A task handed to a pool is therefore prepared at the moment it is
+ * submitted instead; see {@link SubjectPreservingTasks}.
+ * <p>
+ * An instance of this class used as a pool worker holds the Subject it was
+ * started with for the whole of its working life, one task after another, so a
+ * task arriving with an identity of its own has to have that identity
+ * established over the worker's; {@link SubjectPreservingTasks#wrap(Runnable)}
+ * does so, reading the identity on the submitting thread. It does so wherever
+ * {@link SubjectUtil#THREAD_INHERITS_SUBJECT} is {@code false}, which is Java 24
+ * and later. Where that flag is {@code true}, which is Java 21 and earlier, and
+ * wherever a submission carries no identity at all, such a task is passed on
+ * untouched and observes its worker's own Subject: the identity in force when
+ * the worker was started, or none where the worker was started with none.
  * <p>
  * When specifying a Runnable, this class is used in exactly the same way as
  * Thread.
@@ -75,13 +94,8 @@ public class SubjectInheritingThread extends Thread {
    * Behaves similarly to {@link Thread#Thread(ThreadGroup, Runnable)}
    * constructor.
    *
-   * @param group  the thread group. If {@code null} and there is a security
-   *               manager, the group is determined by
-   *               {@linkplain SecurityManager#getThreadGroup
-   *               SecurityManager.getThreadGroup()}. If there is not a security
-   *               manager or {@code
-   *         SecurityManager.getThreadGroup()} returns {@code null}, the group is
-   *               set to the current thread's thread group.
+   * @param group  the thread group. If {@code null}, the group is set to the
+   *               current thread's thread group.
    *
    * @param target the object whose {@code run} method is invoked when this thread
    *               is started. If {@code null}, this thread's run method is
@@ -125,13 +139,8 @@ public class SubjectInheritingThread extends Thread {
   /**
    * Behaves similarly to {@link Thread#Thread(ThreadGroup, String)} constructor.
    *
-   * @param group the thread group. If {@code null} and there is a security
-   *              manager, the group is determined by
-   *              {@linkplain SecurityManager#getThreadGroup
-   *              SecurityManager.getThreadGroup()}. If there is not a security
-   *              manager or {@code
-   *         SecurityManager.getThreadGroup()} returns {@code null}, the group is
-   *              set to the current thread's thread group.
+   * @param group the thread group. If {@code null}, the group is set to the
+   *              current thread's thread group.
    *
    * @param name  the name of the new thread
    */
@@ -143,13 +152,8 @@ public class SubjectInheritingThread extends Thread {
    * Behaves similarly to {@link Thread#Thread(ThreadGroup, Runnable, String)}
    * constructor.
    *
-   * @param group  the thread group. If {@code null} and there is a security
-   *               manager, the group is determined by
-   *               {@linkplain SecurityManager#getThreadGroup
-   *               SecurityManager.getThreadGroup()}. If there is not a security
-   *               manager or {@code
-   *         SecurityManager.getThreadGroup()} returns {@code null}, the group is
-   *               set to the current thread's thread group.
+   * @param group  the thread group. If {@code null}, the group is set to the
+   *               current thread's thread group.
    *
    * @param target the object whose {@code run} method is invoked when this thread
    *               is started. If {@code null}, this thread's run method is

@@ -35,6 +35,7 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 import org.apache.hadoop.classification.VisibleForTesting;
 import org.apache.hadoop.util.Preconditions;
+import org.apache.hadoop.util.concurrent.HadoopThreadPoolExecutor;
 import org.apache.hadoop.thirdparty.com.google.common.cache.CacheBuilder;
 import org.apache.hadoop.thirdparty.com.google.common.cache.CacheLoader;
 import org.apache.hadoop.thirdparty.com.google.common.cache.LoadingCache;
@@ -253,7 +254,7 @@ public class ValueQueue <E> {
                 });
 
     executor =
-        new ThreadPoolExecutor(numFillerThreads, numFillerThreads, 0L,
+        new HadoopThreadPoolExecutor(numFillerThreads, numFillerThreads, 0L,
             TimeUnit.MILLISECONDS, queue, new ThreadFactoryBuilder()
                 .setDaemon(true)
                 .setNameFormat(REFILL_THREAD).build());
@@ -426,6 +427,12 @@ public class ValueQueue <E> {
     // The submit/execute method of the ThreadPoolExecutor is bypassed and
     // the Runnable is directly put in the backing BlockingQueue so that we
     // can control exactly how the runnable is inserted into the queue.
+    // Going round execute() also goes round the Subject preparation
+    // HadoopThreadPoolExecutor does there, so a refill runs under whatever
+    // identity its worker thread already holds and not under the identity of
+    // the request that triggered it. That is intended: a refill serves the
+    // shared per-key cache rather than one caller, and the filler is handed the
+    // key name it needs rather than a caller's credentials.
     queue.put(
         new NamedRunnable(keyName) {
           @Override

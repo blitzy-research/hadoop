@@ -104,7 +104,6 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
@@ -1174,7 +1173,7 @@ public class RegistryDNS extends AbstractService implements DNSOperations,
    */
   protected Record[] getRecords(Name name, int type) {
     Record[] result = null;
-    ExecutorService executor = Executors.newSingleThreadExecutor();
+    ExecutorService executor = HadoopExecutors.newSingleThreadExecutor();
     Future<Record[]> future = executor.submit(new LookupTask(name, type));
     try {
       result = future.get(1500, TimeUnit.MILLISECONDS);

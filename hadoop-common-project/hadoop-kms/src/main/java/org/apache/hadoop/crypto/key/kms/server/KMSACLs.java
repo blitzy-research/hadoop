@@ -26,13 +26,13 @@ import org.apache.hadoop.security.AccessControlException;
 import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.hadoop.security.authorize.AccessControlList;
 import org.apache.hadoop.security.authorize.AuthorizationException;
+import org.apache.hadoop.util.concurrent.HadoopExecutors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.Map;
-import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
@@ -209,7 +209,7 @@ public class KMSACLs implements Runnable, KeyACLs {
 
   public synchronized void startReloader() {
     if (executorService == null) {
-      executorService = Executors.newScheduledThreadPool(1);
+      executorService = HadoopExecutors.newScheduledThreadPool(1);
       executorService.scheduleAtFixedRate(this, RELOADER_SLEEP_MILLIS,
           RELOADER_SLEEP_MILLIS, TimeUnit.MILLISECONDS);
     }

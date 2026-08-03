@@ -49,7 +49,6 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -89,6 +88,7 @@ import org.apache.hadoop.security.token.TokenIdentifier;
 import org.apache.hadoop.util.Shell;
 import org.apache.hadoop.util.StringUtils;
 import org.apache.hadoop.util.Time;
+import org.apache.hadoop.util.concurrent.HadoopExecutors;
 import org.apache.hadoop.util.concurrent.SubjectInheritingThread;
 
 import org.slf4j.Logger;
@@ -927,7 +927,7 @@ public class UserGroupInformation {
   private void executeAutoRenewalTask(final String userName,
                                       AutoRenewalForUserCredsRunnable task) {
     kerberosLoginRenewalExecutor = Optional.of(
-            Executors.newSingleThreadExecutor(
+            HadoopExecutors.newSingleThreadExecutor(
                   new ThreadFactory() {
                     @Override
                     public Thread newThread(Runnable r) {

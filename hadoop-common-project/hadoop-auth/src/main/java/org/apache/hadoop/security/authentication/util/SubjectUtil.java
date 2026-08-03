@@ -44,6 +44,60 @@ import org.apache.hadoop.classification.InterfaceAudience.Private;
  * In JDK 24, the Security Manager has been permanently disabled. See
  * <a href="https://openjdk.org/jeps/486">JEP 486</a> for more information.
  * <p>
+ * {@code SubjectUtil} is the single documented compatibility shim that the
+ * migration to JDK 25 permits, and it is the sole exemption from that
+ * migration's static audit of the main source of every {@code hadoop-common-project}
+ * module, which requires that no other main source there mention the Security
+ * Manager or the classes that surrounded it. Every other main-source occurrence
+ * has been removed, so a hit outside this file is a regression rather than an
+ * accepted exception.
+ * <p>
+ * The method handle bridge below exists solely because this module is compiled
+ * with {@code maven.compiler.release} set to 17, while the replacement API,
+ * {@code Subject.callAs} and {@code Subject.current}, is only visible from
+ * release 18 onwards. Release 17 bytecode cannot name that API directly, yet a
+ * single artifact has to run on both the JDK 17 and the JDK 25 runtime, so the
+ * handles are resolved at class initialization instead. They resolve
+ * {@code javax.security.auth.Subject}, which the {@code java.base} module
+ * exports, so looking them up needs no module-opening or module-export flag on
+ * the JVM command line.
+ * <p>
+ * On a release 18 or later runtime the bridge binds the handles of the
+ * replacement API and nothing else, and that covers every runtime on which the
+ * Security Manager is permanently disabled: there it neither resolves nor
+ * invokes a Security Manager era API, so no code path of that era is reached at
+ * all. Reflecting this way makes new behaviour reachable from old bytecode; it
+ * does not keep an old code path alive.
+ * <p>
+ * A JVM older than release 18 has no replacement API to bind to, so a fallback
+ * is deliberately retained for it, unchanged and predating this migration:
+ * there {@link #current()} is backed by the pre-18 lookups
+ * {@code lookupGetSubject()} and {@code lookupGetContext()}, which name the
+ * classes the replacement API supersedes as {@code loadClass} string arguments,
+ * and the {@code doAs} overloads are backed by the pre-18 {@code Subject.doAs}.
+ * Those lookups are reached only on such a JVM, and those class names appear in
+ * this file only as those string arguments and in the comments that explain
+ * them, so the compiler resolves no reference to any of them.
+ * <p>
+ * {@link #THREAD_INHERITS_SUBJECT} reports one thing only: whether the running
+ * JVM still hands the current subject to a thread it is asked to create. It is
+ * the guard code uses to tell a runtime that carries an identity across a
+ * thread boundary from one that does not, and so to stay out of the way of the
+ * former entirely. Where it has to carry the identity itself, such code reads
+ * the subject with {@link #current()} on the thread that still carries it, then
+ * applies it on the other thread through one of the {@code doAs} overloads
+ * rather than through {@code callAs}: only the {@code doAs} overloads unwrap the
+ * {@link CompletionException} that the replacement API is specified to throw,
+ * and re-throw the original cause, so the exception a caller observes is
+ * unchanged by this migration.
+ * <p>
+ * Throughout the class an action is required and a subject is not: every
+ * overload rejects a {@code null} action, while a {@code null} subject is legal
+ * and runs the action with no subject associated with it. That is not the same
+ * as leaving the subject of an enclosing scope in place, so a caller that wants
+ * a no-op when {@link #current()} finds nothing should skip the call rather than
+ * pass the {@code null} on.
+ * <p>
  * This is derived from Apache Calcite Avatica, which is derived from the Jetty
  * implementation.
  */
@@ -63,6 +117,30 @@ public final class SubjectUtil {
 
   /**
    * True if the current JVM copies the current JAAS subject into new threads automatically.
+   * <p>
+   * This flag is what lets a single source set serve both supported runtimes with
+   * no configuration key of its own: it is derived from the running JVM, and is
+   * {@code true} for a Java specification version of 21 or lower, where a new
+   * thread still inherits the subject of the thread that created it, and
+   * {@code false} for every version above 21. From 24 onwards a new thread never
+   * inherits it. On 22 and 23 inheritance is conditional, and the flag reports
+   * {@code false} for them too, so that code guarding on it carries the subject
+   * itself instead of relying on a condition it does not test; both are
+   * end-of-life non-LTS releases, where carrying it needlessly is preferred to
+   * risking its loss. Code that only needs to carry the subject across a boundary
+   * the JVM no longer crosses for it can guard on this flag and so reduce to a
+   * provable no-op on JDK 17.
+   * <p>
+   * Handing a task to a worker that already exists is a different boundary from
+   * creating a thread, and this flag guards both: where it is {@code true} the
+   * runtime carries the subject into a thread it creates, and Hadoop leaves that
+   * runtime's behaviour, and its cost, exactly as they were; where it is
+   * {@code false} the subject is read at each submission with {@link #current()}
+   * and applied for that one task. A worker given a subject of its own when it
+   * was created goes on holding that one while it runs the tasks of one submitter
+   * after another, so on a runtime that still inherits, and for a submission that
+   * carries no subject at all, a task observes its worker's subject rather than
+   * its submitter's.
    */
   public static final boolean THREAD_INHERITS_SUBJECT = checkThreadInheritsSubject();
 
@@ -260,6 +338,19 @@ public final class SubjectUtil {
    * throw the original exception thrown by action; for lower Java versions,
    * throw a PrivilegedActionException that wraps the original exception when
    * action throw a checked exception.
+   * <p>
+   * Unlike {@link #callAs(Subject, Callable)}, this overload unwraps the
+   * {@link CompletionException} that the replacement API is specified to throw
+   * from release 18 onwards and re-throws its cause, so the caller still observes
+   * the exception the action itself threw. Code that re-establishes an identity
+   * on another thread should therefore go through {@code doAs} rather than
+   * {@code callAs}, which is what keeps exception identity intact for a task
+   * whose failure is later reported by a {@code Future} or by a pool's
+   * uncaught-exception handling.
+   * <p>
+   * The action is required and the subject is not. A {@code null} subject is
+   * legal and runs the action with no subject associated with it, which is not
+   * the same as leaving the subject of an enclosing scope in place.
    *
    * @param subject the subject this action runs as
    * @param action the action to run
@@ -295,6 +386,17 @@ public final class SubjectUtil {
   /**
    * Maps action to a Callable on Java 18 onwards, and delegates to callAs().
    * Call Subject.doAs directly on older JVM.
+   * <p>
+   * The checked exception contract of this overload is identical to that of the
+   * JDK method it replaces: a runtime exception propagates unchanged and a
+   * checked exception arrives wrapped exactly as documented below, on every
+   * supported runtime. A call site therefore moves onto this method by changing
+   * the class it calls and nothing else, with no edit to its {@code throws}
+   * clause or to its {@code catch} blocks.
+   * <p>
+   * As with the other overload, the action is required and the subject is not: a
+   * {@code null} subject is legal and runs the action with no subject associated
+   * with it, rather than leaving the subject of an enclosing scope in place.
    *
    * @param subject the subject this action runs as
    * @param action the action to run
@@ -334,6 +436,12 @@ public final class SubjectUtil {
 
   /**
    * Maps to Subject.current() if available, otherwise maps to Subject.getSubject().
+   * <p>
+   * This is the capture half of the bridge: code that has to run work under the
+   * current identity on another thread reads the subject here, on the thread that
+   * still carries it, and re-establishes it there with one of the {@code doAs}
+   * overloads. The result is {@code null} when no subject is established on the
+   * calling thread.
    *
    * @return the current subject
    */
