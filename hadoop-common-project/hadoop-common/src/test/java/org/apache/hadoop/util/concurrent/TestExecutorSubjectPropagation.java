@@ -938,6 +938,33 @@ public class TestExecutorSubjectPropagation {
         "SubjectPreservingExecutorService.submit(Runnable, T)");
   }
 
+  /**
+   * The same forwarding, entered through the one-argument
+   * {@code submit(Runnable)} rather than the overload that carries a result, and
+   * on a service obtained the way production obtains it. That is the pair of
+   * calls {@link UserGroupInformation}'s ticket renewer makes, and the one
+   * {@code ShutdownHookManager} makes for every hook it runs, so it is asserted
+   * in its own right rather than left to the two-argument overload's coverage.
+   */
+  @Test
+  @Timeout(TIMEOUT_SECONDS)
+  public void testForwardingServiceSubmitRunnableWithoutResultCarriesTheSubject()
+      throws Exception {
+    Subject alice = newSubject(ALICE);
+    ExecutorService pool = register(HadoopExecutors.newSingleThreadExecutor());
+    Recorder recorder = new Recorder();
+    Future<?> submitted = as(alice, new PrivilegedAction<Future<?>>() {
+      @Override
+      public Future<?> run() {
+        return pool.submit(recorder);
+      }
+    });
+    assertNull(submitted.get(TIMEOUT_SECONDS, TimeUnit.SECONDS),
+        "a runnable forwarded without a result should yield null");
+    assertObserved(alice, recorder.awaitOne().subject(),
+        "SubjectPreservingExecutorService.submit(Runnable)");
+  }
+
   @Test
   @Timeout(TIMEOUT_SECONDS)
   public void testForwardingServiceInvokeAllCarriesTheSubmittersSubject()
