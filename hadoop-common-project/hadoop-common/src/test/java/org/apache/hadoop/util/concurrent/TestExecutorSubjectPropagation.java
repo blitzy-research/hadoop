@@ -29,6 +29,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.IOException;
+import java.lang.ref.WeakReference;
 import java.security.PrivilegedAction;
 import java.security.PrivilegedActionException;
 import java.security.PrivilegedExceptionAction;
@@ -43,10 +44,13 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.RunnableFuture;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -1762,5 +1766,304 @@ public class TestExecutorSubjectPropagation {
     }
   }
 
+  // How long a captured identity lives. Establishing one around a task must not
+  // outlast the task: a caller that cancels its work, or a bulk submission that
+  // abandons the tasks it did not need, must leave nothing of its submitter
+  // reachable from the pool. That is a matter of what is prepared rather than of
+  // any releasing step -- a future lets go of the task it was given as soon as it
+  // completes or is cancelled, so preparing the task leaves the identity inside
+  // what the future releases, whereas preparing the future would leave it
+  // outside, held for as long as the queue entry lived. The same choice is what
+  // keeps the queue holding the object a pool would have held with nothing
+  // prepared at all, which is what cancellation sweeps, shut-down lists and task
+  // removal are all expressed in terms of.
+  //
+  // These are asserted two ways, because one is the cause and the other the
+  // effect. The structural assertions read the queue and are exact. The
+  // reachability assertions weakly reference a subject, drop every strong
+  // reference to it and require it to be collected, which is the thing an
+  // operator would actually observe as retained credentials. Both hold on either
+  // runtime: where the runtime propagates the identity itself nothing is
+  // prepared, so the queue holds the pool's own objects for that reason instead,
+  // and a submission still leaves nothing behind.
 
+  /** Something done under a subject that abandons what it submitted. */
+  private interface Abandonment {
+    void make(Subject submitter) throws Exception;
+  }
+
+  /**
+   * Runs {@code abandonment} under a subject of this method's own making and
+   * returns a weak reference to it.
+   * <p>
+   * The subject is reachable only from this frame and from the call, both of
+   * which are gone once this returns, so whether it stays reachable afterwards is
+   * decided entirely by what the executor kept.
+   */
+  private static WeakReference<Subject> abandonUnderANewSubject(
+      Abandonment abandonment) throws Exception {
+    Subject submitter = newSubject(ALICE);
+    WeakReference<Subject> reference = new WeakReference<>(submitter);
+    abandonment.make(submitter);
+    return reference;
+  }
+
+  /**
+   * Requires the referent to be collected, which it can only be once nothing
+   * reaches it. Collection is asked for repeatedly rather than once, so that the
+   * assertion turns on reachability rather than on the timing of a single
+   * collection.
+   */
+  private static void assertLetGoOf(WeakReference<Subject> reference,
+      String what) throws Exception {
+    GenericTestUtils.waitFor(() -> {
+      System.gc();
+      return reference.get() == null;
+    }, 50, TIMEOUT_SECONDS * 1000 / 2,
+        "the identity of " + what + " was still reachable, so credentials of a "
+            + "submitter that walked away were retained");
+  }
+
+  /**
+   * Requires nothing waiting on {@code pool}'s queue to be a prepared task.
+   * <p>
+   * A queue entry that unwraps to something other than itself is one carrying a
+   * captured identity of its own, which is what puts that identity outside the
+   * object the pool releases when the work is cancelled or abandoned.
+   */
+  private static void assertQueueHoldsNothingPrepared(ThreadPoolExecutor pool,
+      String what) {
+    for (Runnable queued : pool.getQueue()) {
+      assertSame(queued, SubjectPreservingTasks.unwrap(queued),
+          "an entry left on the queue by " + what + " carries an identity of "
+              + "its own, so it holds its submitter's credentials for as long "
+              + "as the entry lives");
+    }
+  }
+
+  /**
+   * Ties up the only worker of {@code pool} until the test ends, so that
+   * everything submitted afterwards stays on the queue and can be read there.
+   */
+  private void occupyTheOnlyWorker(ExecutorService pool) throws Exception {
+    CountDownLatch occupied = new CountDownLatch(1);
+    pool.execute(new Runnable() {
+      @Override
+      public void run() {
+        occupied.countDown();
+        try {
+          releaseOccupiedWorkers.await(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+        }
+      }
+    });
+    assertTrue(occupied.await(TIMEOUT_SECONDS, TimeUnit.SECONDS),
+        "the task meant to tie the only worker up never started");
+  }
+
+  private static List<Callable<Subject>> fourObservingTasks() {
+    return Arrays.asList(currentSubject(), currentSubject(), currentSubject(),
+        currentSubject());
+  }
+
+  @Test
+  @Timeout(TIMEOUT_SECONDS)
+  public void testCancellingASubmissionLetsGoOfItsSubmittersIdentity()
+      throws Exception {
+    HadoopThreadPoolExecutor pool = register(singleThreadPool("cancelled"));
+    occupyTheOnlyWorker(pool);
+
+    WeakReference<Subject> submitter = abandonUnderANewSubject(alice -> {
+      Future<Subject> queued = submitObserving(alice, pool);
+      assertFalse(queued.isDone(),
+          "the submission ran while the only worker was busy, so it was never "
+              + "waiting on the queue to be cancelled");
+      assertTrue(queued.cancel(false), "the queued submission did not cancel");
+    });
+
+    assertEquals(1, pool.getQueue().size(),
+        "a cancelled submission left the queue before it could be read, so "
+            + "this no longer covers what a cancelled entry holds");
+    assertQueueHoldsNothingPrepared(pool, "a cancelled submission");
+    assertLetGoOf(submitter, "a submission that was cancelled");
+  }
+
+  @Test
+  @Timeout(TIMEOUT_SECONDS)
+  public void testCancellingAScheduledSubmissionLetsGoOfItsIdentity()
+      throws Exception {
+    HadoopScheduledThreadPoolExecutor pool =
+        register(singleThreadScheduledPool());
+    occupyTheOnlyWorker(pool);
+
+    WeakReference<Subject> scheduler = abandonUnderANewSubject(alice -> {
+      Future<Subject> queued = submitObserving(alice, pool);
+      assertTrue(queued.cancel(false),
+          "the queued scheduled submission did not cancel");
+    });
+
+    assertQueueHoldsNothingPrepared(pool, "a cancelled scheduled submission");
+    assertLetGoOf(scheduler, "a scheduled submission that was cancelled");
+  }
+
+  @Test
+  @Timeout(TIMEOUT_SECONDS)
+  public void testPurgeSweepsASubmissionThatWasCancelled() throws Exception {
+    HadoopThreadPoolExecutor pool = register(singleThreadPool("purged"));
+    occupyTheOnlyWorker(pool);
+    Subject alice = newSubject(ALICE);
+
+    Future<Subject> queued = submitObserving(alice, pool);
+    assertTrue(queued.cancel(false), "the queued submission did not cancel");
+    assertEquals(1, pool.getQueue().size(),
+        "cancelling took the entry off the queue by itself, so purging it is "
+            + "no longer what this covers");
+
+    pool.purge();
+
+    assertEquals(0, pool.getQueue().size(),
+        "the pool did not recognise a cancelled submission as one, so purging "
+            + "left it on the queue holding whatever it holds");
+  }
+
+  @Test
+  @Timeout(TIMEOUT_SECONDS)
+  public void testTasksATimedInvokeAllAbandonsHoldNoIdentity()
+      throws Exception {
+    HadoopThreadPoolExecutor pool = register(singleThreadPool("invoke-all"));
+    occupyTheOnlyWorker(pool);
+
+    WeakReference<Subject> submitter = abandonUnderANewSubject(alice ->
+        asChecked(alice, () -> pool.invokeAll(fourObservingTasks(), 100,
+            TimeUnit.MILLISECONDS)));
+
+    assertQueueHoldsNothingPrepared(pool, "a timed invokeAll that timed out");
+    assertLetGoOf(submitter, "the tasks a timed invokeAll gave up on");
+  }
+
+  @Test
+  @Timeout(TIMEOUT_SECONDS)
+  public void testTasksATimedInvokeAnyAbandonsHoldNoIdentity()
+      throws Exception {
+    HadoopThreadPoolExecutor pool = register(singleThreadPool("invoke-any"));
+    occupyTheOnlyWorker(pool);
+
+    WeakReference<Subject> submitter = abandonUnderANewSubject(alice ->
+        assertThrows(TimeoutException.class,
+            () -> asChecked(alice, () -> pool.invokeAny(fourObservingTasks(),
+                100, TimeUnit.MILLISECONDS)),
+            "a timed invokeAny returned a result although its only worker was "
+                + "busy for the whole of its timeout"));
+
+    assertQueueHoldsNothingPrepared(pool, "a timed invokeAny that timed out");
+    assertLetGoOf(submitter, "the tasks a timed invokeAny gave up on");
+  }
+
+  @Test
+  @Timeout(TIMEOUT_SECONDS)
+  public void testTasksAScheduledTimedInvokeAnyAbandonsHoldNoIdentity()
+      throws Exception {
+    HadoopScheduledThreadPoolExecutor pool =
+        register(singleThreadScheduledPool());
+    occupyTheOnlyWorker(pool);
+
+    WeakReference<Subject> submitter = abandonUnderANewSubject(alice ->
+        assertThrows(TimeoutException.class,
+            () -> asChecked(alice, () -> pool.invokeAny(fourObservingTasks(),
+                100, TimeUnit.MILLISECONDS)),
+            "a timed invokeAny on the scheduled pool returned a result "
+                + "although its only worker was busy throughout"));
+
+    assertQueueHoldsNothingPrepared(pool,
+        "a timed invokeAny on the scheduled pool");
+    assertLetGoOf(submitter,
+        "the tasks a scheduled timed invokeAny gave up on");
+  }
+
+  // What a pool hands back, or is asked to find, when it is named in terms of
+  // the object that was submitted rather than of the work it stands for.
+
+  @Test
+  @Timeout(TIMEOUT_SECONDS)
+  public void testShutdownNowHandsBackTheTaskThatWasSubmitted()
+      throws Exception {
+    HadoopThreadPoolExecutor pool = register(singleThreadPool("shutdown-now"));
+    occupyTheOnlyWorker(pool);
+    Subject alice = newSubject(ALICE);
+    Recorder submitted = new Recorder();
+
+    as(alice, new PrivilegedAction<Void>() {
+      @Override
+      public Void run() {
+        pool.execute(submitted);
+        return null;
+      }
+    });
+
+    List<Runnable> pending = pool.shutdownNow();
+
+    assertEquals(1, pending.size(),
+        "the task that never began was not handed back");
+    assertSame(submitted, pending.get(0),
+        "a caller was handed back something other than the task it submitted, "
+            + "so it cannot recognise, re-submit or report on its own work");
+  }
+
+  @Test
+  @Timeout(TIMEOUT_SECONDS)
+  public void testScheduledShutdownNowHandsBackWhatThePoolHeld()
+      throws Exception {
+    HadoopScheduledThreadPoolExecutor pool =
+        register(singleThreadScheduledPool());
+    Subject alice = newSubject(ALICE);
+
+    as(alice, new PrivilegedAction<Void>() {
+      @Override
+      public Void run() {
+        pool.schedule(new Recorder(), TIMEOUT_SECONDS, TimeUnit.HOURS);
+        return null;
+      }
+    });
+
+    List<Runnable> pending = pool.shutdownNow();
+
+    assertEquals(1, pending.size(),
+        "the scheduled task that never came due was not handed back");
+    assertTrue(pending.get(0) instanceof RunnableFuture,
+        "a scheduled pool handed back something other than the future it "
+            + "holds a scheduled task as, which is what a caller cancels or "
+            + "reads a delay from");
+  }
+
+  @Test
+  @Timeout(TIMEOUT_SECONDS)
+  public void testRemoveWithdrawsATaskThatWasGivenToExecute()
+      throws Exception {
+    HadoopThreadPoolExecutor pool = register(singleThreadPool("removed"));
+    occupyTheOnlyWorker(pool);
+    Subject alice = newSubject(ALICE);
+    Recorder submitted = new Recorder();
+
+    as(alice, new PrivilegedAction<Void>() {
+      @Override
+      public Void run() {
+        pool.execute(submitted);
+        return null;
+      }
+    });
+    assertEquals(1, pool.getQueue().size(),
+        "the task ran while the only worker was busy, so there was nothing "
+            + "waiting to be withdrawn");
+
+    assertTrue(pool.remove(submitted),
+        "a caller could not withdraw the task it had submitted, using the only "
+            + "reference it has to it");
+    assertEquals(0, pool.getQueue().size(),
+        "the withdrawn task was reported as removed but is still queued");
+    assertFalse(pool.remove(submitted),
+        "a task that is no longer queued was reported as withdrawn again");
+    assertFalse(pool.remove(null),
+        "a pool claimed to have withdrawn nothing at all");
+  }
 }
